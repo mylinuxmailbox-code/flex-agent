@@ -1,0 +1,10 @@
+# Flex is a self-contained workspace root.
+# ~/ happens to also be a pnpm workspace root; without this file Flex would be
+# absorbed into it and resolved against the wrong lockfile.
+packages:
+  - '.'
+allowBuilds:
+  # esbuild's postinstall fetches its platform binary; tsx and vitest need it.
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@modelcontextprotocol/sdk@1.30.1'
