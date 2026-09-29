@@ -28,6 +28,8 @@ export interface SandboxRequest {
   additionalWriteRoots?: readonly string[]
   /** `--full-control` and `/sandbox off` both land here. */
   disabled?: boolean
+  /** Secret-shaped env var names to keep anyway (`sandbox.envPassthrough`). */
+  envPassthrough?: readonly string[]
   logger: Logger
 }
 
@@ -53,7 +55,7 @@ export async function createSandbox(request: SandboxRequest): Promise<SandboxRes
     }
   }
 
-  const candidates = backendsForPlatform()
+  const candidates = backendsForPlatform(request.envPassthrough)
   for (const backend of candidates) {
     const probe = await backend.probe()
     if (probe.usable) {
@@ -68,22 +70,21 @@ export async function createSandbox(request: SandboxRequest): Promise<SandboxRes
 
   const reason = candidates.map((b) => `${b.name} unavailable`).join('; ')
   return {
-    sandbox: await new NoSandboxBackend().create(policy, request.logger),
+    sandbox: await new NoSandboxBackend({ passthrough: request.envPassthrough }).create(
+      policy,
+      request.logger,
+    ),
     reason: `${reason}; running unsandboxed`,
   }
 }
 
-function backendsForPlatform(): SandboxBackend[] {
-  switch (process.platform) {
-    case 'linux':
-      return [new BubblewrapBackend(), new NoSandboxBackend()]
-    case 'darwin':
-      // Seatbelt is deprecated but still the only unprivileged option; probing
-      // it decides whether we advertise isolation.
-      return [new BubblewrapBackend(), new NoSandboxBackend()]
-    default:
-      return [new NoSandboxBackend()]
-  }
+function backendsForPlatform(envPassthrough?: readonly string[]): SandboxBackend[] {
+  const fallback = new NoSandboxBackend({ passthrough: envPassthrough })
+  // Only Linux has an isolating backend. There is no Seatbelt or Windows
+  // implementation, and the status bar says "unsandboxed" rather than implying one.
+  return process.platform === 'linux'
+    ? [new BubblewrapBackend({ envPassthrough }), fallback]
+    : [fallback]
 }
 
 /** Flex's own directories, always writable, never needing a grant. */

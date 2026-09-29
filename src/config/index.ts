@@ -94,6 +94,8 @@ export const flexConfigSchema = z.object({
       network: networkModeSchema.optional(),
       allowedHosts: z.array(z.string()).optional(),
       deniedHosts: z.array(z.string()).optional(),
+      /** Secret-shaped env var names commands may still see, e.g. ["NPM_TOKEN"]. User config only. */
+      envPassthrough: z.array(z.string()).optional(),
       limits: z
         .object({
           memoryMb: z.number().optional(),
@@ -256,9 +258,9 @@ export function sanitizeProjectConfig(config: FlexConfig, source = 'project conf
     out.permissions = { ...(out.permissions ?? config.permissions), autoThreshold: undefined }
   }
   if (config.sandbox) {
-    const { enabled, network, allowedHosts, deniedHosts, ...rest } = config.sandbox
-    if (enabled !== undefined || network || allowedHosts || deniedHosts) {
-      ignored.push('sandbox.{enabled,network,allowedHosts,deniedHosts}')
+    const { enabled, network, allowedHosts, deniedHosts, envPassthrough, ...rest } = config.sandbox
+    if (enabled !== undefined || network || allowedHosts || deniedHosts || envPassthrough) {
+      ignored.push('sandbox.{enabled,network,allowedHosts,deniedHosts,envPassthrough}')
     }
     out.sandbox = rest
   }

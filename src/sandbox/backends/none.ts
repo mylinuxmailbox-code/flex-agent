@@ -28,14 +28,21 @@ export class NoSandboxBackend implements SandboxBackend {
    * for the "no backend available" fallback, and off for `--full-control`,
    * where the user asked for the command to run exactly as they would.
    */
-  constructor(private readonly options: { scrubEnv?: boolean } = {}) {}
+  constructor(
+    private readonly options: { scrubEnv?: boolean; passthrough?: readonly string[] } = {},
+  ) {}
 
   async probe(): Promise<{ usable: boolean; detail: string }> {
     return { usable: true, detail: 'commands run directly on the host' }
   }
 
   async create(policy: SandboxPolicy, logger: Logger): Promise<Sandbox> {
-    return new NoSandbox(policy, logger, this.options.scrubEnv ?? true)
+    return new NoSandbox(
+      policy,
+      logger,
+      this.options.scrubEnv ?? true,
+      this.options.passthrough ?? [],
+    )
   }
 }
 
@@ -45,8 +52,15 @@ class NoSandbox implements Sandbox {
   readonly #logger: Logger
 
   readonly #scrub: boolean
+  readonly #passthrough: readonly string[]
 
-  constructor(policy: SandboxPolicy, logger: Logger, scrub: boolean) {
+  constructor(
+    policy: SandboxPolicy,
+    logger: Logger,
+    scrub: boolean,
+    passthrough: readonly string[] = [],
+  ) {
+    this.#passthrough = passthrough
     this.policy = policy
     this.#logger = logger
     this.#scrub = scrub
@@ -74,7 +88,7 @@ class NoSandbox implements Sandbox {
 
   #env(spec: ExecSpec): Record<string, string | undefined> {
     const merged = { ...process.env, ...spec.env }
-    return this.#scrub ? scrubEnv(merged) : merged
+    return this.#scrub ? scrubEnv(merged, this.#passthrough) : merged
   }
 
   spawn(

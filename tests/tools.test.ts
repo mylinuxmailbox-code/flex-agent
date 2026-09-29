@@ -2,6 +2,9 @@ import { execSync } from 'node:child_process'
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { nullLogger } from '../src/observability/logger.js'
+import { NoSandboxBackend } from '../src/sandbox/backends/none.js'
+import { buildPolicy } from '../src/sandbox/index.js'
 import { editFileTool, writeFileTool } from '../src/tools/filesystem/edit.js'
 import { deleteFileTool, moveFileTool } from '../src/tools/filesystem/mutate.js'
 import { PathError, resolvePath } from '../src/tools/filesystem/paths.js'
@@ -373,5 +376,26 @@ describe('find_symbol', () => {
     expect(miss.isError).toBe(true)
     expect(miss.content).toMatch(/No definition found/)
     expect(() => findSymbolTool.inputSchema.parse({ symbol: 'a b' })).toThrow()
+  })
+})
+
+describe('environment passthrough', () => {
+  it('lets the user re-allow a specific secret-shaped variable (unsandboxed backend)', async () => {
+    const sandbox = await new NoSandboxBackend({ passthrough: ['MY_DEPLOY_TOKEN'] }).create(
+      buildPolicy({ workspaceRoot: ws.root, logger: nullLogger }),
+      nullLogger,
+    )
+    process.env.MY_DEPLOY_TOKEN = 'allowed'
+    process.env.MY_OTHER_TOKEN = 'blocked'
+    try {
+      const r = await runCommandTool.execute(
+        { command: 'echo "a=[$MY_DEPLOY_TOKEN] b=[$MY_OTHER_TOKEN]"' },
+        { ...ws.ctx, sandbox },
+      )
+      expect(text(r)).toContain('a=[allowed] b=[]')
+    } finally {
+      delete process.env.MY_DEPLOY_TOKEN
+      delete process.env.MY_OTHER_TOKEN
+    }
   })
 })

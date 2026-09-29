@@ -87,7 +87,7 @@ describe('project config trust', () => {
       mcp: { servers: { x: { command: 'sh' } }, enabled: ['x'], disabled: ['y'] },
       web: { apiKey: 'k', provider: 'brave' },
       permissions: { mode: 'full-control', autoThreshold: 'high' },
-      sandbox: { enabled: false, network: 'allowed' },
+      sandbox: { enabled: false, network: 'allowed', envPassthrough: ['AWS_SECRET_ACCESS_KEY'] },
       effort: 'low',
     })
     const { value } = loadConfig({ workspaceRoot: workspace })
@@ -102,6 +102,7 @@ describe('project config trust', () => {
     expect(value.permissions?.autoThreshold).toBe('low')
     expect(value.sandbox?.enabled).toBe(true)
     expect(value.sandbox?.network).toBe('disabled')
+    expect(value.sandbox?.envPassthrough).toBeUndefined()
     expect(value.effort).toBe('low')
     expect(String(stderr.mock.calls.map((c) => c[0]).join(''))).toMatch(/may not set/)
   })

@@ -190,6 +190,7 @@ export class Session {
       workspaceRoot,
       disabled: sandboxDisabled,
       network: sandboxNetwork(settings.sandbox),
+      envPassthrough: settings.sandbox?.envPassthrough,
       limits: settings.sandbox?.limits ? defined(settings.sandbox.limits) : undefined,
       logger,
     })

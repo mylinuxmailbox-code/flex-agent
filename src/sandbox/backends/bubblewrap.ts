@@ -41,6 +41,8 @@ export interface BubblewrapOptions {
 export class BubblewrapBackend implements SandboxBackend {
   readonly name = 'bubblewrap'
 
+  constructor(private readonly defaults: BubblewrapOptions = {}) {}
+
   async probe(): Promise<{ usable: boolean; detail: string }> {
     try {
       await execa(BIN, ['--version'], { timeout: 5000 })
@@ -88,7 +90,7 @@ export class BubblewrapBackend implements SandboxBackend {
     logger: Logger,
     opts: BubblewrapOptions = {},
   ): Promise<Sandbox> {
-    return new BubblewrapSandbox(policy, logger, opts)
+    return new BubblewrapSandbox(policy, logger, { ...this.defaults, ...opts })
   }
 }
 
