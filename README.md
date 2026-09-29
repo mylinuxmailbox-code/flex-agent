@@ -47,7 +47,7 @@ Run the checks:
 
 ```bash
 pnpm typecheck    # 0 errors
-pnpm test         # 255 passing across 14 files
+pnpm test         # 256 passing across 14 files
 pnpm lint         # 0 errors
 ```
 
@@ -126,10 +126,14 @@ Per-provider knobs: `headers`, `defaultModel`, `contextWindow`, `maxOutputTokens
 
 Provider notes:
 
-- **OpenAI-compatible** streams over SSE, accumulates fragmented tool-call
-  arguments, tolerates servers that omit `usage` or tool-call ids, retries
-  transient errors, maps HTTP 429/5xx/timeouts to distinct error classes, and
-  sends `reasoning_effort` only to models known to accept it.
+- **OpenAI-compatible** streams over SSE (via the OpenAI SDK, so any server that
+  speaks Chat Completions works), reassembles interleaved parallel tool calls by
+  index, reports malformed tool-call JSON as an argument error instead of
+  crashing, refuses to run tool calls from a turn cut off by the length limit,
+  surfaces reasoning separately from text, maps HTTP 4xx/429/5xx/timeouts onto
+  distinct error kinds, discovers models from `GET /models`, and sends
+  `reasoning_effort` / `max_completion_tokens` only when configured or when the
+  model is known to accept them.
 - **Google AI Studio** uses `streamGenerateContent?alt=sse` with the key in the
   `x-goog-api-key` header (never in the URL), maps tool schemas to Gemini's
   OpenAPI subset, preserves `thoughtSignature` on function calls so multi-turn
