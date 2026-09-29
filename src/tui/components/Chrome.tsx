@@ -27,7 +27,9 @@ export function Header({ status, agentState, tick }: HeaderProps) {
     status.modelLabel,
     formatEffort(status.effort),
     status.permissionMode === 'full-control'
-      ? '⚡ FULL CONTROL'
+      ? status.sandboxIsolated
+        ? '⚡ NO PROMPTS'
+        : '⚡ FULL CONTROL'
       : status.permissionMode === 'auto'
         ? 'Auto'
         : 'Ask',
@@ -147,7 +149,9 @@ export function StatusBar({ status, width, hint }: StatusBarProps) {
       key: 'perm',
       text:
         status.permissionMode === 'full-control'
-          ? '⚡ full-control'
+          ? status.sandboxIsolated
+            ? '⚡ no-prompts'
+            : '⚡ full-control'
           : status.permissionMode === 'auto'
             ? 'auto'
             : 'ask',

@@ -90,6 +90,16 @@ export class SubagentRunner {
     this.#deps = deps
   }
 
+  /** Keep delegated work on the same provider/model as the main agent. */
+  setProvider(provider: ModelProvider, model: string): void {
+    this.#deps.provider = provider
+    this.#deps.model = model
+  }
+
+  setEffort(effort: EffortProfile): void {
+    this.#deps.effort = effort
+  }
+
   /**
    * Run every spec, concurrently up to the cap, and collect the results.
    *

@@ -29,10 +29,32 @@ export const effortSchema = z.enum([
 
 export const permissionModeSchema = z.enum(['ask', 'auto', 'full-control'])
 export const networkModeSchema = z.enum(['disabled', 'restricted', 'allowed'])
+export const modelProviderSchema = z.enum(['anthropic', 'openai', 'openai-compatible', 'google'])
+
+const providerConnectionSchema = z
+  .object({
+    apiKey: z.string().optional(),
+    authToken: z.string().optional(),
+    baseURL: z.string().url().optional(),
+    defaultModel: z.string().optional(),
+    contextWindow: z.number().int().positive().optional(),
+    maxOutputTokens: z.number().int().positive().optional(),
+    timeoutMs: z.number().int().positive().optional(),
+    includeUsage: z.boolean().optional(),
+  })
+  .optional()
 
 /** Every value is optional; a partial config is valid and normal. */
 export const flexConfigSchema = z.object({
   model: z.string().optional(),
+  provider: modelProviderSchema.optional(),
+  providers: z
+    .object({
+      anthropic: providerConnectionSchema,
+      openai: providerConnectionSchema,
+      google: providerConnectionSchema,
+    })
+    .optional(),
   effort: effortSchema.optional(),
   permissions: z
     .object({

@@ -1,7 +1,6 @@
 import OpenAI from 'openai'
-import type { ModelProvider } from './provider.js'
+import { collectStream, type ModelProvider } from './provider.js'
 import {
-  type ContentBlock,
   isAbortError,
   ModelError,
   type ModelInfo,
@@ -31,13 +30,16 @@ import {
  */
 
 export interface OpenAICompatibleOptions {
-  baseURL: string
+  /** The endpoint root. `/v1` is added when the URL has no path. */
+  baseURL?: string
   apiKey?: string
   defaultModel?: string
   /** Context window to assume; servers do not reliably report it. */
   contextWindow?: number
   maxOutputTokens?: number
   timeoutMs?: number
+  /** Some local servers reject `stream_options`; disable it when necessary. */
+  includeUsage?: boolean
 }
 
 /** Models offered when the server does not advertise a catalogue. */
@@ -83,18 +85,32 @@ export class OpenAICompatibleProvider implements ModelProvider {
   readonly id = 'openai-compatible'
   readonly label = 'OpenAI-compatible'
   readonly #client: OpenAI
-  readonly #options: OpenAICompatibleOptions
+  readonly #options: Required<
+    Pick<OpenAICompatibleOptions, 'baseURL' | 'timeoutMs' | 'includeUsage'>
+  > &
+    Omit<OpenAICompatibleOptions, 'baseURL' | 'timeoutMs' | 'includeUsage'>
   #models: ModelInfo[] | null = null
 
-  constructor(options: OpenAICompatibleOptions) {
-    this.#options = options
+  constructor(options: OpenAICompatibleOptions = {}) {
+    this.#options = {
+      ...options,
+      baseURL: normalizeBaseURL(
+        options.baseURL ?? process.env.FLEX_OPENAI_BASE_URL ?? process.env.OPENAI_BASE_URL,
+      ),
+      apiKey:
+        options.apiKey ??
+        process.env.FLEX_OPENAI_API_KEY ??
+        process.env.OPENAI_API_KEY ??
+        'not-needed',
+      defaultModel: options.defaultModel ?? process.env.FLEX_OPENAI_MODEL ?? 'gpt-4o',
+      timeoutMs: options.timeoutMs ?? 300_000,
+      includeUsage: options.includeUsage ?? true,
+    }
     this.#client = new OpenAI({
-      // Unlike Anthropic, this baseURL *must* include /v1: the SDK's paths are
-      // relative to it.
-      baseURL: options.baseURL,
-      apiKey: options.apiKey ?? 'not-needed',
+      baseURL: this.#options.baseURL,
+      apiKey: this.#options.apiKey,
       maxRetries: 2,
-      timeout: options.timeoutMs ?? 300_000,
+      timeout: this.#options.timeoutMs,
     })
   }
 
@@ -151,27 +167,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
-    const events: StreamEvent[] = []
-    for await (const event of this.#runStream(request)) events.push(event)
-
-    const content: ContentBlock[] = []
-    let stopReason: StopReason = 'end_turn'
-    let usage: Usage = { inputTokens: 0, outputTokens: 0 }
-    let text = ''
-
-    for (const event of events) {
-      if (event.type === 'text_delta') text += event.text
-      else if (event.type === 'tool_call_end') {
-        content.push({ type: 'tool_use', id: event.id, name: event.name, input: event.input })
-      } else if (event.type === 'usage') usage = event.usage
-      else if (event.type === 'done') {
-        stopReason = event.stopReason
-        usage = event.usage
-      }
-    }
-    if (text) content.unshift({ type: 'text', text })
-
-    return { id: 'openai-compatible', model: request.model, content, stopReason, usage }
+    return collectStream(this.#runStream(request))
   }
 
   async *#runStream(request: ModelRequest): AsyncGenerator<StreamEvent> {
@@ -195,8 +191,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
           messages,
           max_tokens: maxTokens,
           stream: true,
-          // Without this, usage is never reported on a streamed completion.
-          stream_options: { include_usage: true },
+          // OpenAI reports usage on a final choices-less chunk. Some local
+          // servers reject this otherwise optional extension.
+          ...(this.#options.includeUsage ? { stream_options: { include_usage: true } } : {}),
           ...(request.tools.length > 0
             ? {
                 tools: request.tools.map((tool) => ({
@@ -296,9 +293,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
 }
 
 function toOpenAIMessages(request: ModelRequest): OpenAI.ChatCompletionMessageParam[] {
-  const out: OpenAI.ChatCompletionMessageParam[] = [
-    { role: 'system', content: request.system.text },
-  ]
+  const systemText = request.system.toolGuidance
+    ? `${request.system.text}\n\n${request.system.toolGuidance}`
+    : request.system.text
+  const out: OpenAI.ChatCompletionMessageParam[] = [{ role: 'system', content: systemText }]
 
   for (const message of request.messages) {
     const toolResults = message.content.filter((b) => b.type === 'tool_result')
@@ -357,6 +355,19 @@ function mapFinishReason(reason: string | null, hasToolCalls: boolean): StopReas
       return 'tool_use'
     default:
       return 'end_turn'
+  }
+}
+
+function normalizeBaseURL(value: string | undefined): string {
+  const raw = value?.trim() || 'https://api.openai.com/v1'
+  try {
+    const url = new URL(raw)
+    if (!url.pathname || url.pathname === '/') url.pathname = '/v1'
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    // Let the SDK produce its normal actionable URL error, while still
+    // avoiding a surprising `/v1/v1` for a simple custom endpoint.
+    return raw.replace(/\/$/, '')
   }
 }
 

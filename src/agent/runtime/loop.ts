@@ -94,6 +94,11 @@ export class AgentRuntime {
     return this.#lastStopReason
   }
 
+  /** Point the loop at a different provider/model mid-session. */
+  setProvider(provider: ModelProvider): void {
+    ;(this.#opts as { provider: ModelProvider }).provider = provider
+  }
+
   /** Point the loop at a different model mid-session. */
   setModel(model: string): void {
     ;(this.#opts as { model: string }).model = model
@@ -102,6 +107,10 @@ export class AgentRuntime {
   /** Change effort without discarding the conversation. */
   setEffort(effort: EffortProfile): void {
     ;(this.#opts as { effort: EffortProfile }).effort = effort
+  }
+
+  get provider(): ModelProvider {
+    return this.#opts.provider
   }
 
   get sessionId(): string {
@@ -137,6 +146,8 @@ export class AgentRuntime {
    * (Ctrl+C, quit) and the underlying request is aborted with it.
    */
   async *run(input: string, options: RunOptions): AsyncGenerator<AgentEvent> {
+    // Turn limits protect one request, not the lifetime of a session.
+    if (!options.continueTurn) this.#turn = 0
     this.#setState('thinking')
     if (input.trim()) {
       this.#messages.push({ role: 'user', content: [{ type: 'text', text: input }] })
@@ -149,6 +160,20 @@ export class AgentRuntime {
       }
       this.#turn++
       yield { type: 'turn_start', turn: this.#turn }
+
+      const window = this.#opts.provider.resolveModel(this.#opts.model)?.contextWindow ?? 200_000
+      const contextLimit = this.#opts.contextLimitTokens ?? Math.floor(window * 0.8)
+      if (estimateTokens(this.#messages) > contextLimit) {
+        const compacted = this.#compactContext()
+        if (compacted.didCompact) {
+          yield {
+            type: 'context_compacted',
+            beforeTokens: compacted.beforeTokens,
+            afterTokens: compacted.afterTokens,
+          }
+          continue
+        }
+      }
 
       const systemPrompt = buildSystemPrompt({
         ...this.#opts.promptContext,
@@ -249,11 +274,10 @@ export class AgentRuntime {
         this.#messages.push({ role: 'assistant', content: assistantContent })
       }
 
-      const window = this.#opts.provider.resolveModel(this.#opts.model)?.contextWindow ?? 200_000
       yield {
         type: 'usage',
         usage: turnUsage,
-        contextUsed: Math.min(turnUsage.inputTokens, window),
+        contextUsed: Math.min(estimateTokens(this.#messages), window),
         contextWindow: window,
       }
       yield { type: 'turn_end', turn: this.#turn, stopReason }
@@ -384,7 +408,7 @@ export class AgentRuntime {
         continue
       }
 
-      const ctx = this.#toolContext()
+      const ctx = this.#toolContext(undefined, options.signal)
       let display = use.name
       try {
         const action = tool.plan(input as never, ctx)
@@ -427,8 +451,11 @@ export class AgentRuntime {
     // Tools emit progress from inside their own async execution, so it is
     // funnelled through a queue and drained here in arrival order.
     const progress = new AsyncQueue<AgentEvent>()
-    const executions = approved.map(({ use, display }) => this.#executeOne(use, display, progress))
+    const executions = approved.map(({ use, display }) =>
+      this.#executeOne(use, display, progress, options.signal),
+    )
     const settled = Promise.allSettled(executions)
+    void settled.then(() => progress.close())
 
     for await (const event of progress.drain()) {
       yield event
@@ -466,6 +493,7 @@ export class AgentRuntime {
     use: ToolUseBlock,
     display: string,
     progress: AsyncQueue<AgentEvent>,
+    signal: AbortSignal,
   ): Promise<{
     use: ToolUseBlock
     display: string
@@ -483,7 +511,7 @@ export class AgentRuntime {
         return
       }
       progress.push({ type: 'tool_progress', id: use.id, event })
-    })
+    }, signal)
     try {
       const result = await tool.execute(use.input as never, ctx)
       return { use, display, result, durationMs: Date.now() - started }
@@ -495,12 +523,13 @@ export class AgentRuntime {
         result: { content: `Error: ${message}`, isError: true },
         durationMs: Date.now() - started,
       }
-    } finally {
-      progress.close()
     }
   }
 
-  #toolContext(onEvent?: (event: ToolEvent) => void): ToolContext {
+  #toolContext(
+    onEvent?: (event: ToolEvent) => void,
+    signal: AbortSignal = new AbortController().signal,
+  ): ToolContext {
     return {
       cwd: this.#opts.promptContext.workspaceRoot,
       workspaceRoot: this.#opts.promptContext.workspaceRoot,
@@ -508,7 +537,7 @@ export class AgentRuntime {
       sandbox: this.#opts.sandbox,
       logger: this.#opts.logger,
       sessionId: this.#opts.sessionId,
-      signal: new AbortController().signal,
+      signal,
       emit: (event: ToolEvent) => {
         onEvent?.(event)
       },

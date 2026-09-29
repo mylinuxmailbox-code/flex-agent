@@ -126,13 +126,17 @@ export class AnthropicProvider implements ModelProvider {
   readonly label = 'Anthropic'
   readonly #client: Anthropic
   readonly #models: ModelInfo[]
+  readonly #hasCredentials: boolean
 
   constructor(options: AnthropicProviderOptions = {}) {
+    const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY
+    const authToken = options.authToken ?? process.env.ANTHROPIC_AUTH_TOKEN
+    this.#hasCredentials = Boolean(apiKey || authToken)
     this.#client = new Anthropic({
-      apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      apiKey,
       // A proxy baseURL must not carry `/v1`; the SDK concatenates `/v1/messages`.
       baseURL: options.baseURL ?? process.env.ANTHROPIC_BASE_URL,
-      authToken: options.authToken ?? process.env.ANTHROPIC_AUTH_TOKEN,
+      authToken,
       maxRetries: options.maxRetries ?? 2,
       timeout: options.timeoutMs ?? 600_000,
     })
@@ -140,9 +144,8 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   async available(): Promise<{ ok: boolean; reason?: string }> {
-    if (process.env.ANTHROPIC_AUTH_TOKEN) return { ok: true }
-    if (process.env.ANTHROPIC_API_KEY) return { ok: true }
-    return { ok: false, reason: 'ANTHROPIC_API_KEY is not set' }
+    if (this.#hasCredentials) return { ok: true }
+    return { ok: false, reason: 'ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set' }
   }
 
   listModels(): ModelInfo[] {

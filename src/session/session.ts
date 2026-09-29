@@ -5,12 +5,11 @@ import { execa } from 'execa'
 import type { AgentEvent } from '../agent/events.js'
 import { SubagentRunner } from '../agent/orchestrator/runner.js'
 import { AgentRuntime } from '../agent/runtime/loop.js'
-import { loadConfig } from '../config/index.js'
+import { loadConfig, type ResolvedConfig } from '../config/index.js'
 import { readProjectInstructions, summariseRepository } from '../context/repo.js'
 import { mcpManager } from '../mcp/registry.js'
-import { AnthropicProvider } from '../models/anthropic.js'
-import { OpenAICompatibleProvider } from '../models/openai-compatible.js'
 import type { ModelProvider } from '../models/provider.js'
+import { createModelProviders, normalizeProviderId, resolveProvider } from '../models/registry.js'
 import { type EffortLevel, effortProfile } from '../models/types.js'
 import { createLogger, defaultLogDir, type Logger, nullLogger } from '../observability/logger.js'
 import { RiskClassifier } from '../permissions/classifier.js'
@@ -37,8 +36,10 @@ export interface SessionConfig {
   effort: EffortLevel
   permissionMode: PermissionMode
   workspaceRoot: string
-  /** `--full-control` also disables the sandbox. */
+  /** `--full-control` disables prompts and the sandbox. */
   fullControl: boolean
+  /** Disable only isolation while retaining the permission engine. */
+  noSandbox?: boolean
   debug: boolean
   providerId?: string
   baseURL?: string
@@ -61,6 +62,8 @@ export class Session {
   readonly providers: ModelProvider[]
 
   #abort: AbortController | null = null
+  #activeProvider: ModelProvider
+  #subagentRunner: SubagentRunner | null = null
   #activeModel: string
   #activeEffort: EffortLevel
   #createdAt: number = Date.now()
@@ -73,6 +76,7 @@ export class Session {
     permissions: PermissionEngine
     runtime: AgentRuntime
     providers: ModelProvider[]
+    subagentRunner?: SubagentRunner | null
   }) {
     this.config = init.config
     this.logger = init.logger
@@ -81,6 +85,8 @@ export class Session {
     this.permissions = init.permissions
     this.runtime = init.runtime
     this.providers = init.providers
+    this.#activeProvider = init.runtime.provider
+    this.#subagentRunner = init.subagentRunner ?? null
     this.#activeModel = init.config.model
     this.#activeEffort = init.config.effort
   }
@@ -95,10 +101,54 @@ export class Session {
 
     const workspaceRoot = resolve(config.workspaceRoot)
 
+    // Resolve configuration before constructing security-sensitive resources.
+    // The previous order silently ignored project sandbox/network settings.
+    const requestedProvider = normalizeProviderId(config.providerId)
+    const resolved = loadConfig({
+      workspaceRoot,
+      session: {
+        ...(config.model ? { model: config.model } : {}),
+        ...(requestedProvider ? { provider: requestedProvider } : {}),
+        effort: config.effort,
+        permissions: { mode: config.permissionMode },
+        ...(config.fullControl || config.noSandbox ? { sandbox: { enabled: false } } : {}),
+      },
+    })
+    const effectiveEffort = resolved.value.effort ?? config.effort
+    const effectiveProviderId = resolved.value.provider ?? config.providerId
+    const effectiveModel = selectInitialModel(
+      resolved.value.model,
+      resolved.provenance.model,
+      config.model,
+      effectiveProviderId,
+      resolved.value.providers,
+    )
+    const effectivePermissionMode = config.fullControl
+      ? 'full-control'
+      : (resolved.value.permissions?.mode ?? config.permissionMode)
+    const effectiveConfig: SessionConfig = {
+      ...config,
+      model: effectiveModel,
+      effort: effectiveEffort,
+      permissionMode: effectivePermissionMode,
+      workspaceRoot,
+      fullControl: config.fullControl || effectivePermissionMode === 'full-control',
+    }
+
     const { sandbox, reason } = await createSandbox({
       workspaceRoot,
-      disabled: config.fullControl,
-      network: { mode: 'disabled' },
+      disabled:
+        effectiveConfig.fullControl ||
+        config.noSandbox ||
+        resolved.value.sandbox?.enabled === false,
+      network: {
+        mode: resolved.value.sandbox?.network ?? 'disabled',
+        allowHosts: resolved.value.sandbox?.allowedHosts,
+        denyHosts: resolved.value.sandbox?.deniedHosts,
+      },
+      ...(resolved.value.sandbox?.limits
+        ? { limits: definedLimits(resolved.value.sandbox.limits) }
+        : {}),
       logger,
     })
     logger.info('sandbox ready', {
@@ -107,27 +157,18 @@ export class Session {
       reason,
     })
 
-    // Config first: it decides the model, effort, sandbox posture and network
-    // policy that everything below is built from.
-    const resolved = loadConfig({
-      workspaceRoot,
-      session: {
-        model: config.model,
-        effort: config.effort,
-        permissions: { mode: config.permissionMode },
-        ...(config.fullControl ? { sandbox: { enabled: false } } : {}),
-      },
-    })
-    const effectiveEffort = resolved.value.effort ?? config.effort
-    const effectiveModel = resolved.value.model ?? config.model
-
     const tools = new ToolRegistry()
     registerBuiltinTools(tools)
 
     const profile = effortProfile(effectiveEffort)
-    const providers = buildProviders(config)
-    const provider =
-      providers.find((p) => p.resolveModel(effectiveModel)) ?? (providers[0] as ModelProvider)
+    const providers = buildProviders(effectiveConfig, resolved, effectiveModel, effectiveProviderId)
+    const selected = resolveProvider(providers, effectiveModel, effectiveProviderId)
+    if (!selected) {
+      throw new Error(
+        `No provider can resolve model "${effectiveModel}". Configure a provider or choose another model.`,
+      )
+    }
+    const provider = selected.provider
 
     const classifier = new RiskClassifier({
       workspaceRoot,
@@ -138,7 +179,7 @@ export class Session {
     // The prompter is attached later by the UI; until then the engine fails
     // closed on anything risky, which is the safe default.
     const permissions = new PermissionEngine({
-      mode: config.permissionMode,
+      mode: effectivePermissionMode,
       classifier,
       autoThreshold: (resolved.value.permissions?.autoThreshold as 'low') ?? 'low',
       askThreshold: 'low',
@@ -152,16 +193,17 @@ export class Session {
       },
     })
 
-    const id = config.sessionId ?? sessionId()
+    const id = effectiveConfig.sessionId ?? sessionId()
 
     // Subagent delegation is only advertised when the effort profile actually
     // fans out; in single-agent modes the model never sees the option at all.
+    let subagentRunner: SubagentRunner | null = null
     if (profile.subagents) {
       const mutatingTools = tools
         .visible()
         .filter((t) => !t.readOnly)
         .map((t) => t.name)
-      const runner = new SubagentRunner({
+      subagentRunner = new SubagentRunner({
         provider,
         tools,
         permissions,
@@ -173,7 +215,7 @@ export class Session {
         sessionId: id,
         mutatingTools,
       })
-      tools.register(createSpawnSubagentTool(runner, profile.maxSubagents))
+      tools.register(createSpawnSubagentTool(subagentRunner, profile.maxSubagents))
       logger.info('subagent orchestration enabled', {
         main: profile.main,
         subagents: profile.subagents,
@@ -221,7 +263,7 @@ export class Session {
         workspaceRoot,
         repoSummary,
         projectInstructions,
-        notices: buildNotices(config, sandbox),
+        notices: buildNotices(effectiveConfig, sandbox),
         platform: `${process.platform} ${process.arch}`,
         today: new Date().toISOString().slice(0, 10),
         gitBranch,
@@ -231,7 +273,16 @@ export class Session {
       },
     })
 
-    return new Session({ config, logger, sandbox, tools, permissions, providers, runtime })
+    return new Session({
+      config: effectiveConfig,
+      logger,
+      sandbox,
+      tools,
+      permissions,
+      providers,
+      runtime,
+      subagentRunner,
+    })
   }
 
   static async resume(
@@ -294,26 +345,58 @@ export class Session {
     )
   }
 
-  /** Swap model. Returns an error string when the spec is not resolvable. */
+  /** Swap model/provider. Returns an error string when the spec is not resolvable. */
   setModel(spec: string): { ok: true; label: string } | { ok: false; reason: string } {
-    for (const provider of this.providers) {
-      const info = provider.resolveModel(spec)
-      if (!info) continue
-      this.#activeModel = info.id
-      this.runtime.setModel(info.id)
-      return { ok: true, label: info.label }
+    const selected = resolveProvider(this.providers, spec, this.config.providerId)
+    if (selected) {
+      const info = selected.provider.resolveModel(selected.model)
+      if (info) {
+        this.#activeProvider = selected.provider
+        this.#activeModel = info.id
+        this.runtime.setProvider(selected.provider)
+        this.runtime.setModel(info.id)
+        this.#subagentRunner?.setProvider(selected.provider, info.id)
+        return { ok: true, label: info.label }
+      }
     }
-    const known = this.providers.flatMap((p) => p.listModels().map((m) => m.id))
+    const known = this.providers.flatMap((p) => p.listModels().map((m) => `${p.id}:${m.id}`))
     return { ok: false, reason: `Unknown model "${spec}". Known: ${known.slice(0, 8).join(', ')}…` }
   }
 
   setEffort(effort: EffortLevel): void {
     this.#activeEffort = effort
-    this.runtime.setEffort(effortProfile(effort))
+    const profile = effortProfile(effort)
+    this.runtime.setEffort(profile)
+
+    if (profile.subagents && !this.#subagentRunner) {
+      const runner = new SubagentRunner({
+        provider: this.#activeProvider,
+        tools: this.tools,
+        permissions: this.permissions,
+        sandbox: this.sandbox,
+        logger: this.logger,
+        workspaceRoot: this.config.workspaceRoot,
+        model: this.#activeModel,
+        effort: profile,
+        sessionId: this.runtime.sessionId,
+        mutatingTools: this.tools
+          .visible()
+          .filter((tool) => !tool.readOnly)
+          .map((tool) => tool.name),
+      })
+      this.tools.register(createSpawnSubagentTool(runner, profile.maxSubagents))
+      this.#subagentRunner = runner
+    } else if (profile.subagents && this.#subagentRunner) {
+      this.#subagentRunner.setEffort(profile)
+    } else if (!profile.subagents && this.#subagentRunner) {
+      this.tools.unregister('spawn_subagent')
+      this.#subagentRunner = null
+    }
   }
 
   setPermissionMode(mode: PermissionMode): void {
     this.config.permissionMode = mode
+    this.permissions.setMode(mode)
   }
 
   /** Cancel whatever is running. Safe to call when nothing is. */
@@ -328,7 +411,8 @@ export class Session {
     const controller = new AbortController()
     this.#abort = controller
 
-    // Point the loop at whatever model and effort are current right now.
+    // Point the loop at whatever provider, model and effort are current right now.
+    this.runtime.setProvider(this.#activeProvider)
     this.runtime.setModel(this.#activeModel)
     this.runtime.setEffort(effortProfile(this.#activeEffort))
     try {
@@ -376,43 +460,106 @@ export class Session {
   }
 
   private resolveProvider(model: string): ModelProvider | undefined {
-    for (const provider of this.providers) {
-      if (provider.resolveModel(model)) return provider
-    }
-    return this.providers[0]
+    return (
+      resolveProvider(this.providers, model, this.config.providerId)?.provider ??
+      this.#activeProvider
+    )
   }
 }
 
-function buildProviders(config: SessionConfig): ModelProvider[] {
-  const providers: ModelProvider[] = [
-    new AnthropicProvider({
-      apiKey: config.apiKey ?? process.env.ANTHROPIC_API_KEY,
-      baseURL: config.baseURL ?? process.env.ANTHROPIC_BASE_URL,
-    }),
-  ]
-  // An OpenAI-compatible endpoint is opt-in via env, so a user with only an
-  // Anthropic key never trips over a half-configured DeepSeek/Ollama block.
-  const openaiBase = process.env.FLEX_OPENAI_BASE_URL ?? process.env.OPENAI_BASE_URL
-  const openaiKey = process.env.FLEX_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY
-  if (openaiBase) {
-    providers.push(
-      new OpenAICompatibleProvider({
-        baseURL: openaiBase,
-        apiKey: openaiKey ?? 'not-needed',
-        defaultModel: process.env.FLEX_OPENAI_MODEL,
-      }),
-    )
+function selectInitialModel(
+  configuredModel: string | undefined,
+  modelLayer: ResolvedConfig['provenance']['model'],
+  sessionModel: string,
+  providerId?: string,
+  configuredProviders?: ResolvedConfig['value']['providers'],
+): string {
+  if (sessionModel || (configuredModel && modelLayer !== 'defaults')) {
+    return configuredModel ?? sessionModel
   }
-  if (config.providerId === 'openai' && providers.length < 2) {
-    providers.push(
-      new OpenAICompatibleProvider({
-        baseURL: openaiBase ?? 'http://127.0.0.1:11434/v1',
-        apiKey: openaiKey ?? 'ollama',
-        defaultModel: process.env.FLEX_OPENAI_MODEL,
-      }),
-    )
+
+  switch (normalizeProviderId(providerId)) {
+    case 'openai-compatible':
+      return 'gpt-4o'
+    case 'google':
+      return 'gemini-2.5-flash'
+    case 'anthropic':
+      return 'claude-opus-5-5'
+    default: {
+      const hasGoogle =
+        configuredProviders?.google?.apiKey ||
+        configuredProviders?.google?.baseURL ||
+        process.env.FLEX_GOOGLE_BASE_URL ||
+        process.env.FLEX_GOOGLE_API_KEY ||
+        process.env.FLEX_GEMINI_API_KEY ||
+        process.env.GEMINI_API_KEY ||
+        process.env.GOOGLE_API_KEY ||
+        process.env.GOOGLE_AI_API_KEY ||
+        process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+        process.env.GOOGLE_AI_STUDIO_API_KEY
+      const hasOpenAI =
+        configuredProviders?.openai?.apiKey ||
+        configuredProviders?.openai?.baseURL ||
+        process.env.FLEX_OPENAI_BASE_URL ||
+        process.env.FLEX_OPENAI_API_KEY ||
+        process.env.OPENAI_API_KEY
+      const hasAnthropic =
+        configuredProviders?.anthropic?.apiKey ||
+        configuredProviders?.anthropic?.authToken ||
+        configuredProviders?.anthropic?.baseURL ||
+        process.env.ANTHROPIC_API_KEY ||
+        process.env.ANTHROPIC_AUTH_TOKEN ||
+        process.env.ANTHROPIC_BASE_URL
+      if (hasGoogle && !hasAnthropic && !hasOpenAI) return 'gemini-2.5-flash'
+      if (hasOpenAI && !hasAnthropic) {
+        return 'gpt-4o'
+      }
+      return configuredModel ?? 'claude-opus-5-5'
+    }
   }
-  return providers
+}
+
+function buildProviders(
+  config: SessionConfig,
+  resolved: ResolvedConfig,
+  model: string,
+  providerId?: string,
+): ModelProvider[] {
+  const configured = resolved.value.providers
+  const preferred = normalizeProviderId(providerId)
+  const genericKey = config.apiKey
+  const genericBaseURL = config.baseURL
+
+  return createModelProviders({
+    providerId,
+    model,
+    anthropic: {
+      ...configured?.anthropic,
+      ...(preferred === 'anthropic' || !preferred
+        ? { apiKey: genericKey, baseURL: genericBaseURL }
+        : {}),
+    },
+    openai: {
+      ...configured?.openai,
+      ...(preferred === 'openai-compatible' ? { apiKey: genericKey, baseURL: genericBaseURL } : {}),
+    },
+    google: {
+      ...configured?.google,
+      ...(preferred === 'google' ? { apiKey: genericKey, baseURL: genericBaseURL } : {}),
+    },
+  })
+}
+
+function definedLimits(limits: { memoryMb?: number; outputBytes?: number; wallClockMs?: number }): {
+  memoryMb?: number
+  outputBytes?: number
+  wallClockMs?: number
+} {
+  return Object.fromEntries(Object.entries(limits).filter(([, value]) => value !== undefined)) as {
+    memoryMb?: number
+    outputBytes?: number
+    wallClockMs?: number
+  }
 }
 
 function buildNotices(config: SessionConfig, sandbox: Sandbox): string[] {

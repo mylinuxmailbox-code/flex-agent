@@ -14,6 +14,35 @@ Everything else is a slash command inside the session: `/help`, `/model`,
 `/effort`, `/auto`, `/permissions`, `/sandbox`, `/diff`, `/review`, `/test`,
 `/compact`, `/clear`, `/exit`.
 
+## Model providers
+
+Providers are selected from the model family or explicitly with `--provider`.
+Inside a session, `/model google:gemini-2.5-flash` and `/model gpt-4o` switch
+provider and model together without restarting the agent loop.
+
+```bash
+# Anthropic (default when no other provider is configured)
+export ANTHROPIC_API_KEY=...
+flex --model claude-opus-5-5
+
+# OpenAI or any OpenAI-compatible endpoint
+export OPENAI_API_KEY=...
+# Optional for Ollama, vLLM, LM Studio, OpenRouter, or another compatible server:
+export OPENAI_BASE_URL=http://localhost:11434/v1
+flex --provider openai --model qwen2.5-coder
+
+# Google AI Studio / Gemini
+export GEMINI_API_KEY=...
+flex --provider google --model gemini-2.5-flash
+```
+
+`FLEX_OPENAI_API_KEY`, `FLEX_OPENAI_BASE_URL`, `FLEX_OPENAI_MODEL`, and
+`FLEX_GOOGLE_API_KEY`-style project-specific variables may be used alongside
+the standard provider variables. Provider connections can also be configured
+in `.flex/config.json` or `~/.flex/config.json` under `providers.anthropic`,
+`providers.openai`, and `providers.google`. API keys passed through environment
+variables are preferred so they are not written to disk.
+
 ---
 
 ## What is built and verified
@@ -27,7 +56,8 @@ test in `tests/` or by a command you can run.
 | Multiline editor, slash + `@file` completion, history | working |
 | Agent loop — stream, tool calls, parallel execution, stop-reason handling | working, 12 tests |
 | Anthropic provider — streaming, tool use, effort, prompt caching | working |
-| OpenAI-compatible provider — DeepSeek/Ollama/vLLM/OpenRouter | working, untested against a live server |
+| OpenAI-compatible provider — OpenAI/DeepSeek/Ollama/vLLM/LM Studio/OpenRouter | working, streaming/tool calls/usage covered by tests |
+| Google AI Studio provider — Gemini REST/SSE, thinking, streaming/tool calls/usage | working, covered by tests |
 | 21 built-in tools: read, write, edit, move, delete, list, glob, grep, regex, shell, background processes, git, memory, plan, web search/fetch | working |
 | **Sandbox** — bubblewrap, real namespaces, verified by 11 isolation tests | working on this machine |
 | **Risk classifier + permission engine** — 30+ command rules, path rules, network rules | working |
@@ -129,7 +159,7 @@ src/
     subagents/     11 role definitions with scoped tool allowlists
     system-prompt.ts
     events.ts    everything the runtime tells the outside world
-  models/        provider abstraction + Anthropic + OpenAI-compatible adapters
+  models/        provider abstraction + Anthropic + OpenAI-compatible + Google AI Studio adapters
   tools/         filesystem, search, shell, git, web, memory, planning, subagents
   mcp/           MCP client, tool adapter, server registry
   plugins/       manifest, manager, Claude Code compatibility adapter

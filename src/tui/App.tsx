@@ -63,7 +63,7 @@ export function App({ session, store }: AppProps) {
 
   const runTurn = useCallback(
     (text: string) => {
-      if (runningRef.current) return
+      if (runningRef.current || store.getSnapshot().busy) return
       runningRef.current = true
 
       const isCommand = text.startsWith('/')
@@ -228,12 +228,14 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
   const send = (text: string) => {
     store.addUserMessage(text)
     store.setBusy(true)
+    store.patchStatus({ elapsedMs: 0 })
     void (async () => {
       try {
         for await (const event of session.runTurn(text)) store.apply(event)
       } catch (err) {
         store.apply({ type: 'error', error: err instanceof Error ? err : new Error(String(err)) })
       } finally {
+        store.update((state) => sealStreamingAssistant(state))
         store.setBusy(false)
       }
     })()
@@ -286,7 +288,7 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
       store.addNotice(
         next === 'full-control' ? 'warn' : 'info',
         next === 'full-control'
-          ? 'Full control enabled for this session. Commands run without prompts and without sandbox isolation.'
+          ? 'Permission prompts disabled for this session. Sandbox isolation is unchanged; use --full-control before launch to disable it too.'
           : `Permission mode: ${next}`,
       )
     },

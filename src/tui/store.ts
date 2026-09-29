@@ -101,7 +101,7 @@ type Listener = () => void
 export class UIStore {
   #state: UIState = initialState
   #listeners = new Set<Listener>()
-  #pending: (() => void) | null = null
+  #pending: Array<(state: UIState) => UIState> = []
   #flushTimer: NodeJS.Timeout | null = null
   #seq = 0
 
@@ -124,12 +124,10 @@ export class UIStore {
    */
   update(mutate: (state: UIState) => UIState, opts: { coalesce?: boolean } = {}): void {
     if (opts.coalesce) {
-      this.#pending = () => {
-        this.#state = mutate(this.#state)
-        this.#flush()
-      }
-      if (this.#flushTimer) return
-      this.#flushTimer = setTimeout(() => this.flush(), 32)
+      // Keep every delta. Replacing the pending mutation here loses tokens when
+      // a provider emits faster than the terminal frame rate.
+      this.#pending.push(mutate)
+      if (!this.#flushTimer) this.#flushTimer = setTimeout(() => this.flush(), 32)
       return
     }
     this.flush()
@@ -143,9 +141,13 @@ export class UIStore {
       clearTimeout(this.#flushTimer)
       this.#flushTimer = null
     }
+    if (this.#pending.length === 0) return
     const pending = this.#pending
-    this.#pending = null
-    if (pending) pending()
+    this.#pending = []
+    let next = this.#state
+    for (const mutate of pending) next = mutate(next)
+    this.#state = next
+    this.#flush()
   }
 
   #flush(): void {

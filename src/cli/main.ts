@@ -25,8 +25,14 @@ const main = defineCommand({
   args: {
     model: {
       type: 'string',
-      description: 'Model to use, e.g. claude-opus-5-5, sonnet, or any OpenAI-compatible model id',
+      description:
+        'Model to use, e.g. claude-opus-5-5, gemini-2.5-pro, or any OpenAI-compatible model id',
       placeholder: 'model',
+    },
+    provider: {
+      type: 'string',
+      description: 'Provider: anthropic | openai | google (also configurable with FLEX_PROVIDER)',
+      placeholder: 'provider',
     },
     effort: {
       type: 'string',
@@ -82,7 +88,9 @@ const main = defineCommand({
           model: args.model,
           effort,
           permissionMode: args['full-control'] ? 'full-control' : undefined,
-          fullControl: args['full-control'] || args['no-sandbox'],
+          fullControl: args['full-control'],
+          noSandbox: args['no-sandbox'],
+          providerId: args.provider ?? process.env.FLEX_PROVIDER,
           debug: args.debug,
           workspaceRoot,
         })
@@ -94,20 +102,24 @@ const main = defineCommand({
       } else {
         process.stdout.write(`No saved session found for ${workspaceRoot}. Starting fresh.\n\n`)
         session = await Session.create({
-          model: args.model ?? process.env.FLEX_MODEL ?? 'claude-opus-5-5',
+          model: args.model ?? process.env.FLEX_MODEL ?? '',
           effort,
           permissionMode: args['full-control'] ? 'full-control' : 'ask',
-          fullControl: args['full-control'] || args['no-sandbox'],
+          fullControl: args['full-control'],
+          noSandbox: args['no-sandbox'],
+          providerId: args.provider ?? process.env.FLEX_PROVIDER,
           debug: args.debug,
           workspaceRoot,
         })
       }
     } else {
       session = await Session.create({
-        model: args.model ?? process.env.FLEX_MODEL ?? 'claude-opus-5-5',
+        model: args.model ?? process.env.FLEX_MODEL ?? '',
         effort,
         permissionMode: args['full-control'] ? 'full-control' : 'ask',
-        fullControl: args['full-control'] || args['no-sandbox'],
+        fullControl: args['full-control'],
+        noSandbox: args['no-sandbox'],
+        providerId: args.provider ?? process.env.FLEX_PROVIDER,
         debug: args.debug,
         workspaceRoot,
       })

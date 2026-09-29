@@ -55,7 +55,7 @@ interface TaskGrant {
  *   5. the mode's threshold — allow or ask
  */
 export class PermissionEngine implements ToolAuthorizer {
-  readonly mode: PermissionMode
+  mode: PermissionMode
   readonly #opts: PermissionEngineOptions
   readonly #taskGrants: TaskGrant[] = []
   #requestSeq = 0
@@ -65,6 +65,10 @@ export class PermissionEngine implements ToolAuthorizer {
     this.#opts = opts
     this.mode = opts.mode
     this.#prompter = opts.prompter
+  }
+
+  setMode(mode: PermissionMode): void {
+    this.mode = mode
   }
 
   /**
