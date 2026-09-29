@@ -1,6 +1,5 @@
 import type { ModelProvider } from '../../models/provider.js'
 import {
-  type AgentMessage,
   type EffortProfile,
   isAbortError,
   type SingleAgentEffort,
@@ -9,9 +8,9 @@ import {
 import type { Logger } from '../../observability/logger.js'
 import type { ToolAuthorizer } from '../../permissions/types.js'
 import type { Sandbox } from '../../sandbox/types.js'
-import type { ToolRegistry } from '../../tools/registry.js'
-import type { ToolContext, ToolResult } from '../../tools/types.js'
-import { toJsonSchema } from '../../tools/types.js'
+import { ToolRegistry } from '../../tools/registry.js'
+import type { ToolContext } from '../../tools/types.js'
+import { AgentRuntime } from '../runtime/loop.js'
 import { roleDefinition, roleSystemPrompt, type SubagentRole } from '../subagents/roles.js'
 
 /**
@@ -79,9 +78,15 @@ export interface SubagentRunnerDeps {
   model: string
   effort: EffortProfile
   sessionId: string
-  /** Tools a subagent may use for side effects (shell, write). */
-  mutatingTools: readonly string[]
+  /** Tools a subagent may use for side effects (shell, write). May be a getter. */
+  mutatingTools: readonly string[] | (() => readonly string[])
+  /** Forward file changes to the parent's tracked list. */
+  noteFileChange?: (path: string) => void
+  web?: ToolContext['web']
 }
+
+/** A subagent that has not reported after this many model turns is asked to wrap up. */
+const MAX_SUBAGENT_TURNS = 24
 
 export class SubagentRunner {
   readonly #deps: SubagentRunnerDeps
@@ -128,109 +133,81 @@ export class SubagentRunner {
     const definition = roleDefinition(spec.role)
     let toolCalls = 0
     let report = ''
-    let usage: Usage = { inputTokens: 0, outputTokens: 0 }
+    let lastTurnText = ''
 
     const allowed = this.#toolsFor(spec)
     const effort = spec.effort ?? this.#deps.effort.subagents ?? 'high'
-    const model = spec.model ?? this.#deps.model
 
+    // A subagent is an ordinary agent loop with a narrower tool set and a role
+    // prompt. Running the real loop (rather than a second, lighter one) means it
+    // inherits everything the main loop does right: full history across turns,
+    // signed-thinking replay, parallel tools, truncation recovery, permissions.
+    const scoped = new ToolRegistry()
+    for (const name of allowed) {
+      const tool = this.#deps.tools.get(name)
+      if (tool) scoped.register(tool)
+    }
+
+    const runtime = new AgentRuntime({
+      provider: this.#deps.provider,
+      tools: scoped,
+      permissions: this.#deps.permissions,
+      sandbox: this.#deps.sandbox,
+      logger: this.#deps.logger.child({ subagent: spec.id, role: spec.role }),
+      model: spec.model ?? this.#deps.model,
+      effort: { ...this.#deps.effort, main: effort, subagents: null },
+      sessionId: `${this.#deps.sessionId}:${spec.id}`,
+      systemText: roleSystemPrompt(spec.role, spec.task),
+      maxTurns: MAX_SUBAGENT_TURNS,
+      finalizeOnLimit: true,
+      onFileChange: this.#deps.noteFileChange,
+      web: this.#deps.web,
+      promptContext: {
+        workspaceRoot: this.#deps.workspaceRoot,
+        repoSummary: '',
+        projectInstructions: '',
+        notices: [],
+        platform: `${process.platform} ${process.arch}`,
+        today: new Date().toISOString().slice(0, 10),
+      },
+    })
+
+    let failure: Error | null = null
+    let aborted = false
     try {
-      let events = this.#deps.provider.stream({
-        model,
-        system: { text: roleSystemPrompt(spec.role, spec.task) },
-        messages: [{ role: 'user', content: [{ type: 'text', text: spec.task }] }],
-        tools: allowed
-          .map((name) => this.#deps.tools.get(name))
-          .filter(Boolean)
-          .map((tool) => ({
-            name: tool!.name,
-            description: tool!.description,
-            inputSchema: this.#jsonSchema(tool!),
-          })),
-        effort,
-        signal: options.signal,
-      })
-
-      // Drive the subagent loop: stream, run tools, feed back, repeat.
-      const drive = (async () => {
-        for (let turn = 0; turn < 24; turn++) {
-          const collected: string[] = []
-          const pending: Array<{ id: string; name: string; input: unknown }> = []
-
-          for await (const event of events) {
-            if (event.type === 'text_delta') collected.push(event.text)
-            else if (event.type === 'tool_call_end') {
-              pending.push({ id: event.id, name: event.name, input: event.input })
-            } else if (event.type === 'usage') usage = event.usage
-            else if (event.type === 'done') break
-            else if (event.type === 'error') throw event.error
-          }
-
-          if (pending.length === 0) {
-            report = collected.join('')
-            return
-          }
-
-          const results = await Promise.all(
-            pending.map(async (call) => {
-              toolCalls++
-              options.onActivity?.(spec.id, `${definition.label}: ${call.name}`)
-              return this.#callTool(call, allowed, spec, options.signal)
-            }),
-          )
-
-          // Continue the subagent's conversation with the tool results.
-          const messages: AgentMessage[] = [
-            {
-              role: 'assistant',
-              content: [
-                ...(collected.length > 0
-                  ? [{ type: 'text' as const, text: collected.join('') }]
-                  : []),
-                ...pending.map((c) => ({
-                  type: 'tool_use' as const,
-                  id: c.id,
-                  name: c.name,
-                  input: c.input,
-                })),
-              ],
-            },
-            {
-              role: 'user',
-              content: results.map((r) => ({
-                type: 'tool_result' as const,
-                toolUseId: r.toolUseId,
-                content: r.content,
-                isError: r.isError,
-              })),
-            },
-          ]
-
-          const followUp = this.#deps.provider.stream({
-            model,
-            system: { text: roleSystemPrompt(spec.role, spec.task) },
-            messages,
-            tools: allowed
-              .map((name) => this.#deps.tools.get(name))
-              .filter(Boolean)
-              .map((tool) => ({
-                name: tool!.name,
-                description: tool!.description,
-                inputSchema: this.#jsonSchema(tool!),
-              })),
-            effort,
-            signal: options.signal,
-          })
-          events = followUp
+      for await (const event of runtime.run(spec.task, { signal: options.signal })) {
+        switch (event.type) {
+          case 'turn_start':
+            lastTurnText = ''
+            break
+          case 'text_delta':
+            lastTurnText += event.text
+            break
+          case 'tool_start':
+            toolCalls++
+            options.onActivity?.(spec.id, `${definition.label}: ${event.name}`)
+            break
+          case 'error':
+            failure = event.error
+            break
+          case 'done':
+            if (event.stopReason === 'aborted') aborted = true
+            break
+          default:
+            break
         }
-        report = report || 'Subagent reached its turn limit without reporting.'
-      })()
-
-      await drive
-    } catch (err) {
-      if (isAbortError(err)) {
-        return { ...this.#cancelled(spec), durationMs: Date.now() - started, toolCalls }
+        report = lastTurnText
       }
+    } catch (err) {
+      if (isAbortError(err)) aborted = true
+      else failure = err instanceof Error ? err : new Error(String(err))
+    }
+
+    const usage = runtime.usage
+    if (aborted || options.signal.aborted) {
+      return { ...this.#cancelled(spec), usage, durationMs: Date.now() - started, toolCalls }
+    }
+    if (failure) {
       return {
         id: spec.id,
         role: spec.role,
@@ -239,16 +216,15 @@ export class SubagentRunner {
         usage,
         durationMs: Date.now() - started,
         status: 'failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: failure.message,
         toolCalls,
       }
     }
-
     return {
       id: spec.id,
       role: spec.role,
       label: definition.label,
-      report: report.trim(),
+      report: report.trim() || 'The subagent finished without writing a report.',
       usage,
       durationMs: Date.now() - started,
       status: 'completed',
@@ -256,82 +232,22 @@ export class SubagentRunner {
     }
   }
 
-  /**
-   * Run one tool call on a subagent's behalf.
-   *
-   * Authorization is identical to the main agent's — a subagent is not a
-   * privilege level. A denied call comes back as a tool_result error so the
-   * subagent can adjust, exactly as it would for the main agent.
-   */
-  async #callTool(
-    call: { id: string; name: string; input: unknown },
-    allowed: readonly string[],
-    spec: SubagentSpec,
-    signal: AbortSignal,
-  ): Promise<{ toolUseId: string; content: string; isError: boolean }> {
-    const tool = this.#deps.tools.get(call.name)
-    if (!tool || !allowed.includes(call.name)) {
-      return {
-        toolUseId: call.id,
-        content: `Tool "${call.name}" is not available to a ${spec.role} subagent.`,
-        isError: true,
-      }
-    }
-
-    let input: unknown
-    try {
-      input = tool.inputSchema.parse(call.input ?? {})
-    } catch (err) {
-      return {
-        toolUseId: call.id,
-        content: `Invalid arguments: ${err instanceof Error ? err.message : String(err)}`,
-        isError: true,
-      }
-    }
-
-    const ctx: ToolContext = {
-      cwd: this.#deps.workspaceRoot,
-      workspaceRoot: this.#deps.workspaceRoot,
-      permissions: this.#deps.permissions,
-      sandbox: this.#deps.sandbox,
-      logger: this.#deps.logger.child({ subagent: spec.id, role: spec.role }),
-      sessionId: `${this.#deps.sessionId}:${spec.id}`,
-      signal,
-      emit: () => {},
-      noteFileChange: () => {},
-    }
-
-    const action = tool.plan(input as never, ctx)
-    const verdict = await this.#deps.permissions.authorize({ ...action, input })
-    if (verdict.decision.outcome === 'deny') {
-      return {
-        toolUseId: call.id,
-        content: `Permission denied: ${verdict.decision.reason}. Work without it.`,
-        isError: true,
-      }
-    }
-
-    try {
-      const result: ToolResult = await tool.execute(input as never, ctx)
-      return { toolUseId: call.id, content: result.content, isError: result.isError === true }
-    } catch (err) {
-      return {
-        toolUseId: call.id,
-        content: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        isError: true,
-      }
-    }
-  }
-
   #toolsFor(spec: SubagentSpec): readonly string[] {
-    if (spec.tools) return spec.tools
+    // A subagent never spawns subagents: fan-out is the main agent's decision.
+    const noRecursion = (names: readonly string[]) => names.filter((n) => n !== 'spawn_subagent')
+    if (spec.tools) return noRecursion(spec.tools)
     const definition = roleDefinition(spec.role)
-    if (definition.allowedTools) return definition.allowedTools
+    if (definition.allowedTools) return noRecursion(definition.allowedTools)
     // A role with no allowlist gets everything except the tools that change
     // the world, unless it is explicitly an implementer-style role.
+    // Read lazily: MCP and plugin tools register after this runner is built.
+    const mutating = new Set(
+      typeof this.#deps.mutatingTools === 'function'
+        ? this.#deps.mutatingTools()
+        : this.#deps.mutatingTools,
+    )
     const all = this.#deps.tools.visible().map((t) => t.name)
-    const mutating = new Set(this.#deps.mutatingTools)
-    return all.filter((name) => !mutating.has(name) || spec.role === 'implementer')
+    return noRecursion(all.filter((name) => !mutating.has(name) || spec.role === 'implementer'))
   }
 
   #cancelled(spec: SubagentSpec): SubagentResult {
@@ -345,10 +261,6 @@ export class SubagentRunner {
       status: 'cancelled',
       toolCalls: 0,
     }
-  }
-
-  #jsonSchema(tool: NonNullable<ReturnType<ToolRegistry['get']>>): Record<string, unknown> {
-    return toJsonSchema(tool.inputSchema)
   }
 }
 

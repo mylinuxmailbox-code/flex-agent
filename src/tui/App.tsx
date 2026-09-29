@@ -1,6 +1,7 @@
 import { Box, Text, useApp, useInput, useWindowSize } from 'ink'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AgentEvent } from '../agent/events.js'
+import { describeConfig } from '../config/index.js'
 import type { EffortLevel } from '../models/types.js'
 import { EFFORT_LEVELS, effortProfile } from '../models/types.js'
 import type { PermissionChoice, PermissionPrompt } from '../permissions/types.js'
@@ -61,25 +62,13 @@ export function App({ session, store }: AppProps) {
 
   // --- running a turn ------------------------------------------------------
 
-  const runTurn = useCallback(
+  const startTurn = useCallback(
     (text: string) => {
-      if (runningRef.current) return
-      runningRef.current = true
-
-      const isCommand = text.startsWith('/')
-      if (isCommand) {
-        const [name, ...rest] = text.slice(1).split(/\s+/)
-        const command = findCommand(name ?? '')
-        if (command) {
-          void command.run(rest.join(' '), commandContext(session, store, exit))
-          runningRef.current = false
-          return
-        }
-        store.addNotice('error', `Unknown command /${name}. Try /help.`)
-        runningRef.current = false
+      if (runningRef.current) {
+        store.addNotice('warn', 'Still working. Press Esc to interrupt first.')
         return
       }
-
+      runningRef.current = true
       store.addUserMessage(text)
       store.setBusy(true)
       store.patchStatus({ elapsedMs: 0 })
@@ -101,7 +90,33 @@ export function App({ session, store }: AppProps) {
         }
       })()
     },
-    [exit, session, store],
+    [session, store],
+  )
+
+  // Slash commands run immediately, even while the agent is working; only a
+  // command that starts a new turn (via `send`) is held back until it is idle.
+  const runTurn = useCallback(
+    (text: string) => {
+      if (!text.startsWith('/')) {
+        startTurn(text)
+        return
+      }
+      const [name, ...rest] = text.slice(1).split(/\s+/)
+      const command = findCommand(name ?? '')
+      if (!command) {
+        store.addNotice('error', `Unknown command /${name}. Try /help.`)
+        return
+      }
+      Promise.resolve(
+        command.run(rest.join(' '), commandContext(session, store, exit, startTurn)),
+      ).catch((err) =>
+        store.addNotice(
+          'error',
+          `/${command.name} failed: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      )
+    },
+    [exit, session, startTurn, store],
   )
 
   // --- global keys ---------------------------------------------------------
@@ -224,21 +239,12 @@ export function App({ session, store }: AppProps) {
  * routed back through the normal turn pipeline so it appears in the
  * conversation like everything else the agent does.
  */
-function commandContext(session: Session, store: UIStore, exit: () => void): CommandContext {
-  const send = (text: string) => {
-    store.addUserMessage(text)
-    store.setBusy(true)
-    void (async () => {
-      try {
-        for await (const event of session.runTurn(text)) store.apply(event)
-      } catch (err) {
-        store.apply({ type: 'error', error: err instanceof Error ? err : new Error(String(err)) })
-      } finally {
-        store.setBusy(false)
-      }
-    })()
-  }
-
+function commandContext(
+  session: Session,
+  store: UIStore,
+  exit: () => void,
+  send: (text: string) => void,
+): CommandContext {
   return {
     send,
 
@@ -263,8 +269,15 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
 
     setModel(spec: string) {
       const result = session.setModel(spec)
-      if (result.ok) store.addNotice('info', `Model set to ${result.label}.`)
-      else store.addNotice('error', result.reason)
+      if (result.ok) {
+        const missing = session.provider?.configured?.() === false
+        store.addNotice(
+          missing ? 'warn' : 'info',
+          missing
+            ? `Model set to ${result.label}, but ${session.provider?.label} has no credentials yet. See /providers.`
+            : `Model set to ${result.label}${session.provider ? ` (${session.provider.id})` : ''}.`,
+        )
+      } else store.addNotice('error', result.reason)
     },
 
     toggleAuto() {
@@ -278,17 +291,63 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
       )
     },
 
-    cyclePermissionMode() {
-      const order = ['ask', 'auto', 'full-control'] as const
-      const current = order.indexOf(session.config.permissionMode)
-      const next = order[(current + 1) % order.length] ?? 'ask'
-      session.setPermissionMode(next)
+    permissions(arg: string) {
+      const modes = ['ask', 'auto', 'full-control'] as const
+      if (arg) {
+        const next = modes.find((m) => m === arg)
+        if (!next) {
+          store.addNotice('error', `Unknown mode "${arg}". Use ask, auto or full-control.`)
+          return
+        }
+        session.setPermissionMode(next)
+        store.patchStatus({ permissionMode: next })
+        store.addNotice(
+          next === 'full-control' ? 'warn' : 'info',
+          next === 'full-control'
+            ? 'Full control: no permission prompts for the rest of this session. Sandbox isolation is unchanged.'
+            : `Permission mode: ${next}`,
+        )
+        return
+      }
+      const grants = session.permissions.activeGrants()
       store.addNotice(
-        next === 'full-control' ? 'warn' : 'info',
-        next === 'full-control'
-          ? 'Full control enabled for this session. Commands run without prompts and without sandbox isolation.'
-          : `Permission mode: ${next}`,
+        'info',
+        [
+          `Permission mode: ${session.config.permissionMode}`,
+          grants.length > 0
+            ? `Approved for this task:\n${grants.map((g) => `  • ${g.description}`).join('\n')}`
+            : 'Nothing is pre-approved for this task.',
+          'Change it with /permissions ask | auto | full-control.',
+        ].join('\n'),
       )
+    },
+
+    async showProviders() {
+      store.addNotice('info', 'Checking providers…')
+      const providers = await session.describeProviders(true)
+      const lines = providers.map((p) => {
+        const mark = p.ok ? '●' : p.configured ? '◐' : '○'
+        const state = p.ok ? 'ready' : (p.reason ?? 'not available')
+        const first = p.models
+          .slice(0, 3)
+          .map((m) => m.id)
+          .join(', ')
+        const more = p.models.length > 3 ? `, +${p.models.length - 3} more` : ''
+        return `${mark} ${p.id}${p.active ? ' (active)' : ''} — ${state}${first ? `\n    ${first}${more}` : ''}`
+      })
+      store.addNotice(
+        'info',
+        [
+          ...lines,
+          '',
+          'Providers: anthropic, google (AI Studio), openai, or any OpenAI-compatible endpoint from config.',
+          'Use provider:model with /model to pick one explicitly.',
+        ].join('\n'),
+      )
+    },
+
+    showConfig() {
+      store.addNotice('info', describeConfig(session.resolvedConfig))
     },
 
     showStatus() {
@@ -297,7 +356,7 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
       store.addNotice(
         'info',
         [
-          `Model: ${session.modelLabel} (${session.model})`,
+          `Model: ${session.modelLabel} (${session.model})${session.provider ? ` via ${session.provider.id}` : ''}`,
           `Effort: ${formatEffortLabel(session.effort)}`,
           `Permissions: ${session.config.permissionMode}`,
           `Sandbox: ${info.backend} — ${info.isolated ? 'active' : 'NOT ACTIVE'}`,
@@ -321,7 +380,7 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
         }
         store.addNotice(
           'info',
-          `${stat.files} file(s) changed  +${stat.insertions} -${stat.deletions}\nAsk Pixel to show a specific diff, or run git_diff on a path.`,
+          `${stat.files} file(s) changed  +${stat.insertions} -${stat.deletions}\nAsk the agent to show a specific diff, or use \`git diff <path>\` in another terminal.`,
         )
       })
     },
@@ -347,9 +406,12 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
     },
 
     compact() {
+      const result = session.compact()
       store.addNotice(
-        'info',
-        'Compaction runs automatically when context fills. Use /clear to start fresh.',
+        result.didCompact ? 'info' : 'warn',
+        result.didCompact
+          ? `Compacted the conversation: ~${result.beforeTokens.toLocaleString()} → ~${result.afterTokens.toLocaleString()} tokens.`
+          : 'Nothing to compact yet; the conversation is already short.',
       )
     },
 
@@ -359,17 +421,17 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
       )
     },
 
-    undo() {
+    undo(force: boolean) {
       void SnapshotManager.get()
-        .undo()
+        .undo({ force })
         .then((res) => {
           store.addNotice(res.success ? 'info' : 'warn', res.message)
         })
     },
 
-    redo() {
+    redo(force: boolean) {
       void SnapshotManager.get()
-        .redo()
+        .redo({ force })
         .then((res) => {
           store.addNotice(res.success ? 'info' : 'warn', res.message)
         })
@@ -378,13 +440,37 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
     exit,
 
     listAgents() {
+      const profile = effortProfile(session.effort)
+      if (!profile.subagents) {
+        store.addNotice(
+          'info',
+          'Single-agent mode. /effort ultracode (main xHigh + High subagents) or /effort maxcode (main Max + Pro subagents) lets the agent fan out.',
+        )
+        return
+      }
       store.addNotice(
         'info',
-        'No subagents are running. Switch to /effort ultracode (main xHigh + High subagents) or /effort maxcode (main Max + Pro subagents) to fan out.',
+        `Subagents are on: up to ${profile.maxSubagents} run at once at ${profile.subagents} effort. ` +
+          'They start when the agent calls spawn_subagent, and their tool calls appear in the transcript with a sub-N prefix.',
       )
     },
 
-    openPlugins() {
+    async plugins(args: string) {
+      const [verb, name] = args.split(/\s+/)
+      if (verb === 'enable' || verb === 'disable') {
+        if (!name) {
+          store.addNotice('error', `Usage: /plugins ${verb} <name>`)
+          return
+        }
+        const ok = await pluginManager.setEnabled(name, verb === 'enable')
+        store.addNotice(
+          ok ? 'info' : 'error',
+          ok
+            ? `Plugin ${name} ${verb}d. MCP servers change on next start.`
+            : `No plugin named "${name}".`,
+        )
+        return
+      }
       store.addNotice('info', pluginManager.formatStatus())
     },
 
@@ -408,15 +494,20 @@ function commandContext(session: Session, store: UIStore, exit: () => void): Com
       )
     },
 
-    listModels() {
-      const models = session.providers.flatMap((p) =>
-        p
-          .listModels()
-          .map((m) => `${m.id}  —  ${m.label}, ${Math.round(m.contextWindow / 1000)}k ctx`),
-      )
+    async listModels() {
+      const providers = await session.describeProviders(true)
+      const blocks = providers
+        .filter((p) => p.models.length > 0)
+        .map((p) => {
+          const rows = p.models.map(
+            (m) =>
+              `  ${m.id.padEnd(30)} ${m.label}, ${Math.round(m.contextWindow / 1000)}k ctx${m.id === session.model ? '  ← current' : ''}`,
+          )
+          return `${p.label}${p.configured ? '' : ' (no credentials)'}\n${rows.join('\n')}`
+        })
       store.addNotice(
         'info',
-        `Available models:\n${models.join('\n')}\n\nSet one with /model <name>.`,
+        `${blocks.join('\n\n')}\n\nSet one with /model <name>. Any model id your endpoint serves works as provider:model.`,
       )
     },
 

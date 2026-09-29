@@ -58,7 +58,7 @@ export const webSearchTool: Tool<typeof inputSchema> = {
       tool: 'web_search',
       purpose: `search: ${input.query}`,
       input,
-      network: [{ host: 'search-api', protocol: 'https', transmits: 'query text' }],
+      network: [{ host: 'search-api', protocol: 'https' }],
     }
   },
 

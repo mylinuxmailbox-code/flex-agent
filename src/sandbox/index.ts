@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { Logger } from '../observability/logger.js'
+import { flexHome } from '../paths.js'
 import { BubblewrapBackend } from './backends/bubblewrap.js'
 import { NoSandboxBackend } from './backends/none.js'
 import {
@@ -92,7 +93,7 @@ export function flexDirs(): {
   stateDir: string
   logDir: string
 } {
-  const base = process.env.FLEX_HOME ?? join(homedir(), '.flex')
+  const base = flexHome()
   const configDir = join(base, 'config')
   const cacheDir = join(base, 'cache')
   const stateDir = join(base, 'state')

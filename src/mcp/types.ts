@@ -3,7 +3,11 @@ export interface MCPServerConfig {
   command: string
   args?: string[]
   env?: Record<string, string>
+  cwd?: string
+  timeoutMs?: number
   disabled?: boolean
+  /** Where the definition came from; project-level servers must be opted into. */
+  source?: 'user' | 'project' | 'plugin'
   /**
    * What this server is allowed to do. A plugin author declares these; an
    * absent declaration is treated as the most restrictive reading.

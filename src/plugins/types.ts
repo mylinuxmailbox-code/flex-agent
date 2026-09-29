@@ -1,3 +1,5 @@
+import type { MCPServerConfig } from '../mcp/types.js'
+import type { Skill } from '../skills/types.js'
 import type { Tool } from '../tools/types.js'
 import type { Command } from '../tui/commands.js'
 
@@ -30,4 +32,6 @@ export interface FlexPlugin {
   enabled: boolean
   tools: Tool[]
   commands: Command[]
+  skills?: Skill[]
+  mcpServers?: MCPServerConfig[]
 }

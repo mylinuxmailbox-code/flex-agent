@@ -1,9 +1,10 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { diffLines } from 'diff'
+import { createTwoFilesPatch, diffLines } from 'diff'
 import { z } from 'zod'
 import type { Tool, ToolResult } from '../types.js'
 import { errorResult, fail, ok } from '../types.js'
+import { readTextForSnapshot } from './mutate.js'
 import { PathError, resolvePath, toDisplayPath } from './paths.js'
 import { SnapshotManager } from './snapshots.js'
 
@@ -92,7 +93,8 @@ export const editFileTool: Tool<typeof inputSchema> = {
 
     const updated = input.replace_all
       ? original.split(input.old_string).join(input.new_string)
-      : original.replace(input.old_string, input.new_string)
+      : // A function, so `$&`, `$1` and friends in new_string stay literal text.
+        original.replace(input.old_string, () => input.new_string)
 
     try {
       await SnapshotManager.get().record(abs, original, updated, `edit ${input.path}`)
@@ -140,18 +142,10 @@ function lineNumbersOf(haystack: string, needle: string): number[] {
 }
 
 function unifiedDiff(path: string, before: string, after: string): string {
-  const parts = diffLines(before, after)
-  let out = `--- a/${path}\n+++ b/${path}\n`
-  let emitted = 0
-  for (const part of parts) {
-    if (part.added) out += `+${part.value.replace(/\n$/, '')}\n`
-    else if (part.removed) out += `-${part.value.replace(/\n$/, '')}\n`
-    if (emitted++ > MAX_DIFF_LINES) {
-      out += `… diff truncated after ${MAX_DIFF_LINES} lines\n`
-      break
-    }
-  }
-  return out
+  const patch = createTwoFilesPatch(`a/${path}`, `b/${path}`, before, after, '', '', { context: 3 })
+  const lines = patch.replace(/^Index: .*\n=+\n/, '').split('\n')
+  if (lines.length <= MAX_DIFF_LINES) return lines.join('\n')
+  return `${lines.slice(0, MAX_DIFF_LINES).join('\n')}\n… diff truncated after ${MAX_DIFF_LINES} lines\n`
 }
 
 function renderDiff(path: string, before: string, after: string): string {
@@ -219,18 +213,19 @@ export const writeFileTool: Tool<typeof writeSchema> = {
     const existed = await stat(abs)
       .then((s) => s.isFile())
       .catch(() => false)
-    let before = ''
-    if (existed) {
-      before = await readFile(abs, 'utf8').catch(() => '')
-    }
+    // null for a binary or oversized file: replacing it is allowed but cannot be undone.
+    const before = existed ? await readTextForSnapshot(abs) : null
+    const undoable = !existed || before !== null
 
     try {
-      await SnapshotManager.get().record(
-        abs,
-        existed ? before : null,
-        input.content,
-        `${existed ? 'replace' : 'create'} ${input.path}`,
-      )
+      if (undoable) {
+        await SnapshotManager.get().record(
+          abs,
+          existed ? before : null,
+          input.content,
+          `${existed ? 'replace' : 'create'} ${input.path}`,
+        )
+      }
       await mkdir(dirname(abs), { recursive: true })
       await writeFile(abs, input.content, 'utf8')
     } catch (err) {
@@ -239,12 +234,13 @@ export const writeFileTool: Tool<typeof writeSchema> = {
 
     ctx.noteFileChange(abs)
     const display = toDisplayPath(abs, ctx.workspaceRoot)
-    if (existed)
+    if (existed && before !== null) {
       ctx.emit({ type: 'diff', path: abs, diff: unifiedDiff(input.path, before, input.content) })
+    }
 
     const bytes = Buffer.byteLength(input.content, 'utf8')
     return ok(
-      `${existed ? 'Replaced' : 'Created'} ${input.path} (${input.content.split('\n').length} lines, ${bytes} bytes).`,
+      `${existed ? 'Replaced' : 'Created'} ${input.path} (${input.content.split('\n').length} lines, ${bytes} bytes).${undoable ? '' : ' The previous content was binary or too large to snapshot, so /undo cannot restore it.'}`,
       `${existed ? 'replace' : 'create'} ${display}`,
       { path: abs, created: !existed, bytes },
     )

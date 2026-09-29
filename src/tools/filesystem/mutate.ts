@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { z } from 'zod'
 import type { Tool, ToolResult } from '../types.js'
@@ -69,11 +69,25 @@ export const moveFileTool: Tool<typeof moveSchema> = {
       )
     }
 
+    // Text files are snapshotted so /undo can put them back. The order matters:
+    // undo pops newest-first, so removing the new path comes before restoring the old.
+    const source = await readTextForSnapshot(from)
+    const overwritten = destinationExists ? await readTextForSnapshot(to) : null
     try {
       await mkdir(dirname(to), { recursive: true })
       await rename(from, to)
     } catch (err) {
       return errorResult(err, `move ${input.from}`)
+    }
+    if (source !== null) {
+      const snaps = SnapshotManager.get()
+      await snaps.record(from, source, null, `move ${input.from} → ${input.to} (remove old path)`)
+      await snaps.record(
+        to,
+        overwritten,
+        source,
+        `move ${input.from} → ${input.to} (create new path)`,
+      )
     }
 
     ctx.noteFileChange(from)
@@ -144,21 +158,20 @@ export const deleteFileTool: Tool<typeof deleteSchema> = {
 
     const isDirectory = stats.isDirectory()
     if (isDirectory && !input.recursive) {
-      const entries = await readFile(abs, 'utf8').then(
-        () => ['(non-empty)'],
-        () => [],
-      )
-      return fail(
-        `${input.path} is a directory${entries.length > 0 ? ' and is not empty' : ''}. ` +
-          'Pass recursive: true to delete it and everything inside.',
-        `delete ${input.path} (dir)`,
-      )
+      const entries = await readdir(abs).catch(() => ['?'])
+      if (entries.length > 0) {
+        return fail(
+          `${input.path} is a directory and is not empty. ` +
+            'Pass recursive: true to delete it and everything inside.',
+          `delete ${input.path} (dir)`,
+        )
+      }
     }
 
     const display = toDisplayPath(abs, ctx.workspaceRoot)
     try {
       if (!isDirectory) {
-        const before = await readFile(abs, 'utf8').catch(() => null)
+        const before = await readTextForSnapshot(abs)
         if (before !== null) {
           await SnapshotManager.get().record(abs, before, null, `delete ${input.path}`)
         }
@@ -169,11 +182,32 @@ export const deleteFileTool: Tool<typeof deleteSchema> = {
     }
 
     ctx.noteFileChange(abs)
-    return ok(`Deleted ${input.path}${isDirectory ? ' (recursive)' : ''}.`, `delete ${display}`)
+    return ok(
+      `Deleted ${input.path}${isDirectory && input.recursive ? ' (recursive; not undoable)' : ''}.`,
+      `delete ${display}`,
+    )
   },
 }
 
 /** Expand `~` and relative segments for a caller that already validated scope. */
 export function absolutize(path: string, base: string): string {
   return isAbsolute(path) ? resolve(path) : resolve(base, path)
+}
+
+const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
+
+/**
+ * File contents for the undo stack, or null when that would not be faithful:
+ * directories, large files, and binaries (a UTF-8 round trip corrupts them).
+ */
+export async function readTextForSnapshot(path: string): Promise<string | null> {
+  try {
+    const info = await stat(path)
+    if (!info.isFile() || info.size > MAX_SNAPSHOT_BYTES) return null
+    const buffer = await readFile(path)
+    if (buffer.subarray(0, 8192).includes(0)) return null
+    return buffer.toString('utf8')
+  } catch {
+    return null
+  }
 }

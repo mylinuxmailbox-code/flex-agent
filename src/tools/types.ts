@@ -13,6 +13,14 @@ export type ToolEvent =
   | { type: 'files-changed'; paths: string[] }
   | { type: 'plan'; steps: PlanStep[] }
 
+export interface WebSettings {
+  provider?: 'auto' | 'anthropic' | 'brave' | 'exa' | 'tavily' | 'duckduckgo' | 'none'
+  apiKey?: string
+  maxResults?: number
+  allowedDomains?: string[]
+  blockedDomains?: string[]
+}
+
 /** What the model sees back. Kept small on purpose — it becomes context. */
 export interface ToolResult {
   content: string
@@ -34,6 +42,8 @@ export interface ToolContext {
   readonly sessionId: string
   /** Aborts when the user cancels (Esc / Ctrl+C). */
   readonly signal: AbortSignal
+  /** Search and fetch settings from config. Absent means defaults. */
+  readonly web?: WebSettings
   emit(event: ToolEvent): void
   /** Track a file the user should be able to review afterwards. */
   noteFileChange(path: string): void
@@ -58,6 +68,14 @@ export interface Tool<TSchema extends z.ZodType = z.ZodType> {
   /** Describe the action for the risk classifier, before it runs. */
   plan(input: z.output<TSchema>, ctx: ToolContext): ActionDescription
   execute(input: z.output<TSchema>, ctx: ToolContext): Promise<ToolResult>
+  /**
+   * The JSON Schema the model sees, when it differs from what the zod schema
+   * would produce. MCP tools use this: their real schema comes from the server,
+   * and the zod side only needs to accept an object.
+   */
+  readonly jsonSchema?: Record<string, unknown>
+  /** Set false to opt out of strict schema enforcement (schemas we did not write). */
+  readonly strictSchema?: boolean
   /** Overrides the default prompt guidance injected into the system prompt. */
   readonly promptGuidance?: string
 }
@@ -75,7 +93,7 @@ export type ToolCategory =
 
 /** Convert a tool's zod schema to the JSON Schema the model sees. */
 export function toJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  const json = z.toJSONSchema(schema, { io: 'output', unrepresentable: 'any' }) as Record<
+  const json = z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }) as Record<
     string,
     unknown
   >

@@ -11,7 +11,7 @@ describe('SnapshotManager', () => {
 
   beforeEach(async () => {
     tmp = await mkdtemp(join(tmpdir(), 'flex-snap-test-'))
-    manager = new SnapshotManager(join(tmp, 'snaps'))
+    manager = new SnapshotManager()
   })
 
   afterEach(async () => {

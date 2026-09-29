@@ -108,7 +108,7 @@ export const COMMAND_RULES: readonly CommandRule[] = [
       /(^|[\s;|&(])(rm|mv|cp|chmod|chown|truncate|tee)\s+[^|;&]*(\/etc\/|\/usr\/|\/bin\/|\/sbin\/|\/boot\/|\/System\/|C:\\Windows)/,
     signal: 'system-modification',
     level: 'high',
-    reason: 'modifies files outside the system directories',
+    reason: 'modifies files in system directories',
   },
   {
     id: 'permission-change',

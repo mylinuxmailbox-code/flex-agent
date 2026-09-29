@@ -1,32 +1,45 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 export interface FileSnapshot {
   id: string
   path: string
   timestamp: number
-  /** null means file was newly created and did not exist before */
+  /** null means the file did not exist before */
   previousContent: string | null
-  /** null means file was deleted */
+  /** null means the file was deleted */
   newContent: string | null
   summary: string
 }
 
+export interface UndoResult {
+  success: boolean
+  message: string
+  path?: string
+}
+
+/** Enough for a long session; older entries fall off the far end. */
+const MAX_HISTORY = 100
+
+/**
+ * In-memory undo/redo for file edits made by the agent.
+ *
+ * Snapshots are deliberately not written to disk: they contain whole file
+ * contents (possibly secrets), and an undo stack that outlives the process
+ * would promise something Flex does not verify — the file may have changed
+ * since. Use git for anything durable.
+ *
+ * Undo and redo refuse to overwrite a file that has been changed since the
+ * recorded edit, so `/undo` cannot silently destroy the user's own work.
+ * `force` overrides that check.
+ */
 export class SnapshotManager {
   private static instance: SnapshotManager
   private undoStack: FileSnapshot[] = []
   private redoStack: FileSnapshot[] = []
-  private baseDir: string
-
-  constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? join(homedir(), '.flex', 'snapshots')
-  }
 
   static get(): SnapshotManager {
-    if (!SnapshotManager.instance) {
-      SnapshotManager.instance = new SnapshotManager()
-    }
+    if (!SnapshotManager.instance) SnapshotManager.instance = new SnapshotManager()
     return SnapshotManager.instance
   }
 
@@ -44,19 +57,9 @@ export class SnapshotManager {
       newContent,
       summary,
     }
-
     this.undoStack.push(snapshot)
-    this.redoStack = [] // clear redo on new action
-
-    // Optionally persist to disk for forensics
-    try {
-      const snapFile = join(this.baseDir, `${snapshot.id}.json`)
-      await mkdir(dirname(snapFile), { recursive: true })
-      await writeFile(snapFile, JSON.stringify(snapshot, null, 2), 'utf8')
-    } catch {
-      // non-fatal
-    }
-
+    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift()
+    this.redoStack = [] // a new edit invalidates the redo branch
     return snapshot
   }
 
@@ -68,22 +71,21 @@ export class SnapshotManager {
     return this.redoStack.length > 0
   }
 
-  async undo(): Promise<{ success: boolean; message: string; path?: string }> {
-    const snapshot = this.undoStack.pop()
-    if (!snapshot) {
-      return { success: false, message: 'Nothing to undo.' }
-    }
+  clear(): void {
+    this.undoStack = []
+    this.redoStack = []
+  }
+
+  async undo(options: { force?: boolean } = {}): Promise<UndoResult> {
+    const snapshot = this.undoStack.at(-1)
+    if (!snapshot) return { success: false, message: 'Nothing to undo.' }
+
+    const drift = await this.#drift(snapshot.path, snapshot.newContent, options.force)
+    if (drift) return { success: false, message: drift, path: snapshot.path }
 
     try {
-      if (snapshot.previousContent === null) {
-        // Was created; undoing means deleting it
-        await rm(snapshot.path, { force: true })
-      } else {
-        // Restore previous content
-        await mkdir(dirname(snapshot.path), { recursive: true })
-        await writeFile(snapshot.path, snapshot.previousContent, 'utf8')
-      }
-
+      await this.#apply(snapshot.path, snapshot.previousContent)
+      this.undoStack.pop()
       this.redoStack.push(snapshot)
       return {
         success: true,
@@ -91,8 +93,6 @@ export class SnapshotManager {
         path: snapshot.path,
       }
     } catch (err) {
-      // Put it back if restore failed
-      this.undoStack.push(snapshot)
       return {
         success: false,
         message: `Failed to undo: ${err instanceof Error ? err.message : String(err)}`,
@@ -101,22 +101,16 @@ export class SnapshotManager {
     }
   }
 
-  async redo(): Promise<{ success: boolean; message: string; path?: string }> {
-    const snapshot = this.redoStack.pop()
-    if (!snapshot) {
-      return { success: false, message: 'Nothing to redo.' }
-    }
+  async redo(options: { force?: boolean } = {}): Promise<UndoResult> {
+    const snapshot = this.redoStack.at(-1)
+    if (!snapshot) return { success: false, message: 'Nothing to redo.' }
+
+    const drift = await this.#drift(snapshot.path, snapshot.previousContent, options.force)
+    if (drift) return { success: false, message: drift, path: snapshot.path }
 
     try {
-      if (snapshot.newContent === null) {
-        // Redoing a delete
-        await rm(snapshot.path, { force: true })
-      } else {
-        // Redoing content write
-        await mkdir(dirname(snapshot.path), { recursive: true })
-        await writeFile(snapshot.path, snapshot.newContent, 'utf8')
-      }
-
+      await this.#apply(snapshot.path, snapshot.newContent)
+      this.redoStack.pop()
       this.undoStack.push(snapshot)
       return {
         success: true,
@@ -124,7 +118,6 @@ export class SnapshotManager {
         path: snapshot.path,
       }
     } catch (err) {
-      this.redoStack.push(snapshot)
       return {
         success: false,
         message: `Failed to redo: ${err instanceof Error ? err.message : String(err)}`,
@@ -137,8 +130,26 @@ export class SnapshotManager {
     return this.undoStack
   }
 
-  clear(): void {
-    this.undoStack = []
-    this.redoStack = []
+  /** A message when the file no longer matches what the snapshot expects, else null. */
+  async #drift(path: string, expected: string | null, force?: boolean): Promise<string | null> {
+    if (force) return null
+    let current: string | null
+    try {
+      current = await readFile(path, 'utf8')
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      current = null
+    }
+    if (current === expected) return null
+    return `${path} has changed since that edit; refusing to overwrite it. Use "/undo force" (or "/redo force") to override.`
+  }
+
+  async #apply(path: string, content: string | null): Promise<void> {
+    if (content === null) {
+      await rm(path, { force: true })
+      return
+    }
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, content, 'utf8')
   }
 }

@@ -17,21 +17,24 @@ export interface CommandContext {
   setEffort(effort: EffortLevel): void
   setModel(model: string): void
   toggleAuto(): void
-  cyclePermissionMode(): void
+  /** `/permissions` — with no argument shows state; with `ask|auto|full-control` switches. */
+  permissions(arg: string): void
   showStatus(): void
   showDiff(): void
   showPlan(): void
   runTests(): void
   compact(): void
   review(): void
-  undo(): void
-  redo(): void
+  undo(force: boolean): void
+  redo(force: boolean): void
   exit(): void
   listAgents(): void
-  openPlugins(): void
+  plugins(args: string): void | Promise<void>
   webSearch(): void
   showSandbox(): void
-  listModels(): void
+  listModels(): void | Promise<void>
+  showProviders(): void | Promise<void>
+  showConfig(): void
   showHelp(): void
 }
 
@@ -42,6 +45,8 @@ export interface Command {
   /** Argument hint, e.g. `<level>`. */
   args?: string
   aliases?: string[]
+  /** Set for commands contributed by a plugin. */
+  source?: string
   /** Detailed help shown when the command is run bare. */
   detail?: string
   run(args: string, ctx: CommandContext): void | Promise<void>
@@ -71,7 +76,9 @@ const COMMAND_LIST: Command[] = [
     name: 'model',
     summary: 'Switch model',
     args: '[name]',
-    detail: 'Accepts a full id (claude-opus-5-5) or a short alias (opus, sonnet, haiku).',
+    detail:
+      'Accepts a full id (claude-opus-5-5, gemini-2.5-pro, gpt-5), a short alias (opus, sonnet, flash), ' +
+      'or provider:model to pick the endpoint explicitly (google:gemini-2.5-pro, ollama:qwen2.5-coder).',
     run: (args, ctx) => {
       if (!args.trim()) ctx.listModels()
       else ctx.setModel(args.trim())
@@ -99,13 +106,27 @@ const COMMAND_LIST: Command[] = [
     summary: 'Toggle auto mode',
     detail:
       'Auto mode approves anything the risk classifier rates safe or low, and asks about anything with ' +
-      'meaningful risk. It is not "allow everything".',
+      'meaningful risk. Deletes, publishes, credential access and the like always ask. It is not "allow everything".',
     run: (_args, ctx) => ctx.toggleAuto(),
   },
   {
     name: 'permissions',
-    summary: 'Show permission mode and active grants',
-    run: (_args, ctx) => ctx.cyclePermissionMode(),
+    summary: 'Show or change the permission mode',
+    args: '[ask|auto|full-control]',
+    detail:
+      'ask: prompts for anything above trivial risk. auto: also lets low-risk work (like installing dependencies) proceed.\n' +
+      'full-control: no prompts. The sandbox stays as it was started; use --full-control at launch to also drop it.',
+    run: (args, ctx) => ctx.permissions(args.trim().toLowerCase()),
+  },
+  {
+    name: 'providers',
+    summary: 'Show model providers and whether each is ready',
+    run: (_args, ctx) => ctx.showProviders(),
+  },
+  {
+    name: 'config',
+    summary: 'Show the effective configuration and where each value came from',
+    run: (_args, ctx) => ctx.showConfig(),
   },
   {
     name: 'sandbox',
@@ -150,23 +171,27 @@ const COMMAND_LIST: Command[] = [
   {
     name: 'undo',
     summary: 'Revert the last file change',
-    run: (_args, ctx) => ctx.undo(),
+    args: '[force]',
+    detail: 'Refuses if the file changed since the edit; `/undo force` overrides that.',
+    run: (args, ctx) => ctx.undo(args.trim() === 'force'),
   },
   {
     name: 'redo',
     summary: 'Re-apply the last undone change',
-    run: (_args, ctx) => ctx.redo(),
+    args: '[force]',
+    run: (args, ctx) => ctx.redo(args.trim() === 'force'),
   },
   {
     name: 'compact',
     summary: 'Compact the conversation to free context',
-    detail: 'Summarises older turns while keeping recent tool results verbatim.',
+    detail: 'Replaces older turns with a short digest while keeping recent tool results verbatim.',
     run: (_args, ctx) => ctx.compact(),
   },
   {
     name: 'plugins',
-    summary: 'Manage plugins',
-    run: (_args, ctx) => ctx.openPlugins(),
+    summary: 'List plugins, or enable/disable one',
+    args: '[enable|disable <name>]',
+    run: (args, ctx) => ctx.plugins(args.trim()),
   },
   {
     name: 'web',
@@ -186,13 +211,23 @@ for (const command of COMMAND_LIST) {
 }
 
 /** Plugins register here at runtime; completion picks them up immediately. */
-export function registerCommand(command: Command): void {
-  if (BY_NAME.has(command.name)) {
-    throw new Error(`command already registered: ${command.name}`)
-  }
+export function registerCommand(command: Command): boolean {
+  // A plugin must not be able to shadow a built-in or another plugin's command.
+  if (BY_NAME.has(command.name)) return false
   COMMAND_LIST.push(command)
   BY_NAME.set(command.name, command)
-  for (const alias of command.aliases ?? []) BY_NAME.set(alias, command)
+  for (const alias of command.aliases ?? []) {
+    if (!BY_NAME.has(alias)) BY_NAME.set(alias, command)
+  }
+  return true
+}
+
+export function unregisterCommand(name: string): void {
+  const command = BY_NAME.get(name)
+  if (!command?.source) return // built-ins cannot be removed
+  const index = COMMAND_LIST.indexOf(command)
+  if (index >= 0) COMMAND_LIST.splice(index, 1)
+  for (const [key, value] of BY_NAME) if (value === command) BY_NAME.delete(key)
 }
 
 export function findCommand(name: string): Command | undefined {

@@ -24,19 +24,28 @@ export class MCPServerConnection implements MCPCaller {
       },
     )
 
+    // Only the SDK's small safe environment (PATH, HOME, ...) plus what the
+    // server's config asks for. Passing all of process.env would hand every
+    // API key in the parent to every third-party server.
     this.transport = new StdioClientTransport({
       command: this.config.command,
       args: this.config.args ?? [],
-      // StdioClientTransport wants Record<string,string>; process.env can hold
-      // undefined, which is dropped rather than stringified.
-      env: Object.fromEntries(
-        Object.entries({ ...process.env, ...(this.config.env ?? {}) }).filter(
-          (entry): entry is [string, string] => entry[1] !== undefined,
-        ),
-      ),
+      env: this.config.env ?? {},
+      ...(this.config.cwd ? { cwd: this.config.cwd } : {}),
+      stderr: 'ignore',
     })
 
-    await this.client.connect(this.transport)
+    const timeoutMs = this.config.timeoutMs ?? 15_000
+    await withTimeout(
+      (async () => {
+        await this.client?.connect(this.transport as StdioClientTransport)
+      })(),
+      timeoutMs,
+      `MCP server "${this.config.name}" did not start within ${timeoutMs / 1000}s`,
+    ).catch(async (err) => {
+      await this.close()
+      throw err
+    })
 
     const listResult = await this.client.listTools()
     this.tools = listResult.tools.map((t) => ({
@@ -48,7 +57,10 @@ export class MCPServerConnection implements MCPCaller {
     return this.tools
   }
 
-  async callTool(params: { name: string; arguments?: Record<string, unknown> }): Promise<{
+  async callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    options?: { signal?: AbortSignal },
+  ): Promise<{
     content: Array<{ type: string; text?: string; [key: string]: unknown }>
     isError?: boolean
   }> {
@@ -56,10 +68,11 @@ export class MCPServerConnection implements MCPCaller {
       throw new Error(`MCP server "${this.config.name}" is not connected.`)
     }
 
-    const result = await this.client.callTool({
-      name: params.name,
-      arguments: params.arguments ?? {},
-    })
+    const result = await this.client.callTool(
+      { name: params.name, arguments: params.arguments ?? {} },
+      undefined,
+      options?.signal ? { signal: options.signal } : undefined,
+    )
 
     return {
       content: result.content as Array<{ type: string; text?: string }>,
@@ -80,4 +93,12 @@ export class MCPServerConnection implements MCPCaller {
   getTools(): readonly MCPToolDefinition[] {
     return this.tools
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }

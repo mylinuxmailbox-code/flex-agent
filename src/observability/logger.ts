@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { flexHome } from '../paths.js'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
@@ -158,5 +158,5 @@ export const nullLogger: Logger = {
 }
 
 export function defaultLogDir(): string {
-  return join(homedir(), '.flex', 'logs')
+  return join(flexHome(), 'logs')
 }

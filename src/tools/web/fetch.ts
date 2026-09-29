@@ -54,7 +54,7 @@ export const webFetchTool: Tool<typeof inputSchema> = {
       tool: 'web_fetch',
       purpose: `fetch ${input.url}`,
       input,
-      network: [{ host, protocol: 'https', transmits: 'none (read-only fetch)' }],
+      network: [{ host, protocol: 'https' }],
     }
   },
 

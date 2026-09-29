@@ -5,7 +5,10 @@ import { errorResult, fail, ok } from '../tools/types.js'
 import type { MCPToolDefinition } from './types.js'
 
 export interface MCPCaller {
-  callTool(params: { name: string; arguments?: Record<string, unknown> }): Promise<{
+  callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    options?: { signal?: AbortSignal },
+  ): Promise<{
     content: Array<{ type: string; text?: string; [key: string]: unknown }>
     isError?: boolean
   }>
@@ -54,6 +57,9 @@ export function adaptMCPTool(
     name: flexName,
     description,
     inputSchema,
+    jsonSchema: { ...toolDef.inputSchema, type: 'object' },
+    // A schema written by a third party is not ours to promise is strict-clean.
+    strictSchema: false,
     readOnly: isReadOnly,
     category: 'code' as ToolCategory,
 
@@ -72,7 +78,8 @@ export function adaptMCPTool(
         network: (capabilities.networkHosts ?? [`mcp:${serverName}`]).map((host) => ({
           host,
           protocol: 'other' as const,
-          transmits: 'tool arguments',
+          // Only a tool that can change things is treated as sending data out.
+          ...(declaredReadOnly ? {} : { transmits: 'tool arguments' }),
         })),
         // An undeclared third-party tool is raised to high by the classifier,
         // which is above every auto threshold — so it prompts.
@@ -84,10 +91,10 @@ export function adaptMCPTool(
       ctx.emit({ type: 'status', text: `Calling ${flexName}` })
 
       try {
-        const response = await caller.callTool({
-          name: toolDef.name,
-          arguments: input,
-        })
+        const response = await caller.callTool(
+          { name: toolDef.name, arguments: input },
+          { signal: ctx.signal },
+        )
 
         const textParts = response.content
           .filter((c) => c.type === 'text' && typeof c.text === 'string')

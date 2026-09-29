@@ -81,7 +81,8 @@ export class ToolRegistry {
       .map((t) => ({
         name: t.name,
         description: t.description,
-        inputSchema: toJsonSchema(t.inputSchema),
+        inputSchema: t.jsonSchema ?? toJsonSchema(t.inputSchema),
+        ...(t.strictSchema === false ? { strict: false } : {}),
       }))
   }
 

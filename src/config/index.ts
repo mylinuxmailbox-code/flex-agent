@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
+import { flexHome } from '../paths.js'
 import { flexDirs } from '../sandbox/index.js'
 
 /**
@@ -219,7 +219,8 @@ export function merge(base: FlexConfig, overlay: FlexConfig): FlexConfig {
  * A repository controls its own `.flex/config.json`, and a repository you just
  * cloned is not trusted. Anything that could redirect a credential or run a
  * program is therefore ignored at the project layer and reported once:
- * provider endpoints and keys, and MCP server definitions. Per-user config is
+ * provider endpoints and keys, MCP servers, and anything that loosens the
+ * sandbox or permission posture. Per-user config is
  * where those belong.
  */
 export function sanitizeProjectConfig(config: FlexConfig, source = 'project config'): FlexConfig {
@@ -238,15 +239,32 @@ export function sanitizeProjectConfig(config: FlexConfig, source = 'project conf
   }
   if (config.mcp?.servers && Object.keys(config.mcp.servers).length > 0) {
     ignored.push('mcp.servers')
-    out.mcp = { ...config.mcp, servers: undefined }
   }
+  if (config.mcp?.enabled?.length) ignored.push('mcp.enabled')
+  if (config.mcp) out.mcp = { ...config.mcp, servers: undefined, enabled: undefined }
   if (config.web?.apiKey) {
     ignored.push('web.apiKey')
     out.web = { ...config.web, apiKey: undefined }
   }
+  // A repository must not widen its own permissions or turn the sandbox off.
+  if (config.permissions?.mode === 'full-control') {
+    ignored.push('permissions.mode=full-control')
+    out.permissions = { ...config.permissions, mode: undefined }
+  }
+  if (config.permissions?.autoThreshold) {
+    ignored.push('permissions.autoThreshold')
+    out.permissions = { ...(out.permissions ?? config.permissions), autoThreshold: undefined }
+  }
+  if (config.sandbox) {
+    const { enabled, network, allowedHosts, deniedHosts, ...rest } = config.sandbox
+    if (enabled !== undefined || network || allowedHosts || deniedHosts) {
+      ignored.push('sandbox.{enabled,network,allowedHosts,deniedHosts}')
+    }
+    out.sandbox = rest
+  }
   if (ignored.length > 0) {
     process.stderr.write(
-      `flex: ${source} may not set ${ignored.join(', ')} (a repository cannot redirect credentials or start programs). Put them in your user config.\n`,
+      `flex: ${source} may not set ${ignored.join(', ')} (a repository cannot redirect credentials, start programs, or loosen the sandbox). Put them in your user config.\n`,
     )
   }
   return out
@@ -304,7 +322,7 @@ export function saveProjectConfig(workspaceRoot: string, patch: FlexConfig): voi
 
 /** `FLEX_HOME` lets tests and sandboxes relocate all Flex state. */
 export function configHome(): string {
-  return process.env.FLEX_HOME ?? join(homedir(), '.flex')
+  return flexHome()
 }
 
 /** Human-readable dump of the effective config with the layer each key came from. */

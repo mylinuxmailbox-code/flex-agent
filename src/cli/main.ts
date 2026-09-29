@@ -25,7 +25,8 @@ const main = defineCommand({
   args: {
     model: {
       type: 'string',
-      description: 'Model to use, e.g. claude-opus-5-5, sonnet, or any OpenAI-compatible model id',
+      description:
+        'Model to use: claude-opus-5-5, sonnet, gemini-2.5-pro, gpt-5, or provider:model (e.g. ollama:qwen2.5-coder). Defaults to config, then the first provider with a key.',
       placeholder: 'model',
     },
     effort: {
@@ -63,7 +64,7 @@ const main = defineCommand({
   async run({ args }) {
     const workspaceRoot = resolve(args.cwd ?? process.cwd())
 
-    const effort = normaliseEffort(args.effort)
+    const effort = normaliseEffort(args.effort ?? process.env.FLEX_EFFORT)
     if (effort === null) {
       process.stderr.write(
         `Unknown effort "${args.effort}". Valid levels: low, medium, high, xhigh, pro, max, ultracode, maxcode.\n`,
@@ -71,20 +72,27 @@ const main = defineCommand({
       process.exit(2)
     }
 
+    // Only what was actually passed goes in. Anything left unset falls through to
+    // config files and then to the first provider that has credentials.
+    const model = args.model ?? process.env.FLEX_MODEL
+    const base = {
+      model,
+      effort: effort ?? undefined,
+      fullControl: args['full-control'] || args['no-sandbox'],
+      debug: args.debug,
+      workspaceRoot,
+    }
+
     let session: Session
     let resumedMessages: readonly AgentMessage[] = []
     let resumedPlan: readonly PlanStep[] = []
 
-    if (args.continue) {
-      const latest = await sessionPersistence.findLatest(workspaceRoot)
+    try {
+      const latest = args.continue ? await sessionPersistence.findLatest(workspaceRoot) : null
       if (latest) {
         session = await Session.resume(latest, {
-          model: args.model,
-          effort,
+          ...base,
           permissionMode: args['full-control'] ? 'full-control' : undefined,
-          fullControl: args['full-control'] || args['no-sandbox'],
-          debug: args.debug,
-          workspaceRoot,
         })
         resumedMessages = latest.messages
         resumedPlan = latest.plan
@@ -92,26 +100,23 @@ const main = defineCommand({
           `Resumed session ${latest.id} (${latest.messages.length} messages).\n\n`,
         )
       } else {
-        process.stdout.write(`No saved session found for ${workspaceRoot}. Starting fresh.\n\n`)
+        if (args.continue) {
+          process.stdout.write(`No saved session found for ${workspaceRoot}. Starting fresh.\n\n`)
+        }
         session = await Session.create({
-          model: args.model ?? process.env.FLEX_MODEL ?? 'claude-opus-5-5',
-          effort,
-          permissionMode: args['full-control'] ? 'full-control' : 'ask',
-          fullControl: args['full-control'] || args['no-sandbox'],
-          debug: args.debug,
-          workspaceRoot,
+          ...base,
+          permissionMode: args['full-control'] ? 'full-control' : undefined,
         })
       }
-    } else {
-      session = await Session.create({
-        model: args.model ?? process.env.FLEX_MODEL ?? 'claude-opus-5-5',
-        effort,
-        permissionMode: args['full-control'] ? 'full-control' : 'ask',
-        fullControl: args['full-control'] || args['no-sandbox'],
-        debug: args.debug,
-        workspaceRoot,
-      })
+    } catch (err) {
+      process.stderr.write(
+        `flex: could not start: ${err instanceof Error ? err.message : String(err)}\n`,
+      )
+      process.exit(1)
     }
+
+    for (const notice of session.startupNotices) process.stdout.write(`! ${notice}\n`)
+    if (session.startupNotices.length > 0) process.stdout.write('\n')
 
     if (args['full-control']) {
       // Printed before the UI starts so it lands in the scrollback and stays
@@ -143,12 +148,17 @@ const main = defineCommand({
     })
 
     const instance = mountUI(session, store)
-    await instance.waitUntilExit()
+    try {
+      await instance.waitUntilExit()
+    } finally {
+      // MCP servers are child processes; leaving them running leaks them.
+      await session.close()
+    }
   },
 })
 
-function normaliseEffort(value: string | undefined): EffortLevel | null {
-  if (!value) return 'high'
+function normaliseEffort(value: string | undefined): EffortLevel | null | undefined {
+  if (!value) return undefined
   const normalized = value.trim().toLowerCase() as EffortLevel
   const valid: EffortLevel[] = [
     'low',

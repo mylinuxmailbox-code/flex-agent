@@ -371,6 +371,7 @@ describe('GoogleProvider (Gemini API against a local server)', () => {
         maxOutputTokens: 1000,
       }),
     )
+    // biome-ignore lint/suspicious/noExplicitAny: loosely-typed wire body
     const body = server.requests.at(-1)!.body as Record<string, any>
     expect(body.systemInstruction.parts[0].text).toBe('You are Flex.')
     expect(body.contents).toEqual([{ role: 'user', parts: [{ text: 'hi' }] }])
@@ -439,6 +440,7 @@ describe('GoogleProvider (Gemini API against a local server)', () => {
         ],
       }),
     )
+    // biome-ignore lint/suspicious/noExplicitAny: loosely-typed wire body
     const body = server.requests.at(-1)!.body as { contents: Array<{ role: string; parts: any[] }> }
     expect(body.contents.map((c) => c.role)).toEqual(['user', 'model', 'user'])
     expect(body.contents[1]?.parts[0]).toMatchObject({
@@ -599,6 +601,7 @@ describe('GoogleProvider (Gemini API against a local server)', () => {
 
 describe('Gemini wire helpers', () => {
   it('converts JSON Schema to the OpenAPI subset', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: loosely-typed schema tree
     const schema = toGeminiSchema({
       $schema: 'x',
       type: 'object',
@@ -614,7 +617,7 @@ describe('Gemini wire helpers', () => {
       required: ['name', 'ghost'],
       additionalProperties: false,
       $defs: { Inner: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] } },
-    }) as any
+    }) as Record<string, any>
     expect(schema.type).toBe('OBJECT')
     expect(schema.required).toEqual(['name'])
     expect(schema.properties.name).toEqual({ type: 'STRING', nullable: true, description: 'n' })
@@ -786,7 +789,9 @@ describe('provider registry and router', () => {
 
       const b = await router.complete(baseRequest({ model: 'openai:my-model' }))
       expect(b.content).toEqual([{ type: 'text', text: 'from openai' }])
-      expect((openai.requests.at(-1)?.body as { model: string }).model).toBe('my-model')
+      expect((openai.requests.at(-1)?.body as { model: string } | undefined)?.model).toBe(
+        'my-model',
+      )
     } finally {
       await google.close()
       await openai.close()

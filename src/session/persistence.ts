@@ -1,8 +1,8 @@
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { PlanStep } from '../agent/events.js'
 import type { AgentMessage, EffortLevel } from '../models/types.js'
+import { flexHome } from '../paths.js'
 import type { PermissionMode } from '../permissions/types.js'
 
 export interface PersistedSession {
@@ -21,24 +21,61 @@ export interface PersistedSession {
 }
 
 export class SessionPersistence {
-  readonly baseDir: string
+  readonly #baseDir: string | undefined
+  /** Saves are serialised per session so two quick turns cannot interleave writes. */
+  readonly #queue = new Map<string, Promise<void>>()
+  /** Called when a save fails. Persistence must never crash a turn, but it must not be silent. */
+  onError: ((error: unknown) => void) | undefined
 
   constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? join(homedir(), '.flex', 'sessions')
+    this.#baseDir = baseDir
+  }
+
+  /** Resolved on every use so `FLEX_HOME` set after import is honoured. */
+  get baseDir(): string {
+    return this.#baseDir ?? join(flexHome(), 'sessions')
   }
 
   private sessionFile(id: string): string {
-    return join(this.baseDir, `${id}.json`)
+    // Ids come from us, but a resumed file name is user-influenced.
+    return join(this.baseDir, `${id.replace(/[^\w.-]/g, '_')}.json`)
   }
 
-  async save(session: PersistedSession): Promise<void> {
+  save(session: PersistedSession): Promise<void> {
+    const previous = this.#queue.get(session.id) ?? Promise.resolve()
+    const next = previous.then(() => this.#write(session))
+    this.#queue.set(session.id, next)
+    void next.finally(() => {
+      if (this.#queue.get(session.id) === next) this.#queue.delete(session.id)
+    })
+    return next
+  }
+
+  async #write(session: PersistedSession): Promise<void> {
     try {
       const file = this.sessionFile(session.id)
-      await mkdir(dirname(file), { recursive: true })
-      await writeFile(file, JSON.stringify(session, null, 2), 'utf8')
-    } catch (_err) {
-      // non-fatal, log or ignore
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+      // Write-then-rename so a crash mid-write cannot leave a truncated session.
+      const tmp = `${file}.${process.pid}.tmp`
+      await writeFile(tmp, JSON.stringify(session), { encoding: 'utf8', mode: 0o600 })
+      await rename(tmp, file)
+    } catch (err) {
+      this.onError?.(err)
     }
+  }
+
+  /** Delete sessions beyond `keep` most recent, and any older than `maxAgeDays`. */
+  async prune(options: { keep?: number; maxAgeDays?: number } = {}): Promise<number> {
+    const keep = options.keep ?? 200
+    const cutoff = Date.now() - (options.maxAgeDays ?? 90) * 86_400_000
+    const all = await this.list()
+    let removed = 0
+    for (const [index, session] of all.entries()) {
+      if (index >= keep || session.updatedAt < cutoff) {
+        if (await this.delete(session.id)) removed++
+      }
+    }
+    return removed
   }
 
   async load(id: string): Promise<PersistedSession | null> {

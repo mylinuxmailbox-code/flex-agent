@@ -45,6 +45,20 @@ export interface AgentRuntimeOptions {
   /** Rough context ceiling before compaction. Defaults to 80% of the window. */
   contextLimitTokens?: number
   sessionId: string
+  /** Replaces the standard system prompt. Subagents run under a role prompt instead. */
+  systemText?: string
+  /** Model turns allowed per request. Defaults to 200. */
+  maxTurns?: number
+  /**
+   * When the turn cap is reached, spend one last tool-less turn asking for a
+   * report instead of stopping mid-work. Subagents need this: their caller is
+   * waiting for an answer, not a "stopped" notice.
+   */
+  finalizeOnLimit?: boolean
+  /** Called for every file a tool reports changing (subagents feed the parent's list). */
+  onFileChange?: (path: string) => void
+  /** Search/fetch settings from config, passed to tools. */
+  web?: ToolContext['web']
 }
 
 export interface RunOptions {
@@ -54,7 +68,7 @@ export interface RunOptions {
 }
 
 /** Guard against a model that keeps calling tools forever. */
-const MAX_TURNS = 200
+const DEFAULT_MAX_TURNS = 200
 
 export class AgentRuntime {
   readonly #opts: AgentRuntimeOptions
@@ -88,6 +102,12 @@ export class AgentRuntime {
 
   get changedFiles(): readonly string[] {
     return [...this.#changedFiles]
+  }
+
+  /** Record a file as changed in this session (also called by subagents). */
+  trackFile(path: string): void {
+    this.#changedFiles.add(path)
+    this.#opts.onFileChange?.(path)
   }
 
   get lastStopReason(): StopReason {
@@ -138,11 +158,14 @@ export class AgentRuntime {
    */
   async *run(input: string, options: RunOptions): AsyncGenerator<AgentEvent> {
     this.#setState('thinking')
-    if (input.trim()) {
-      this.#messages.push({ role: 'user', content: [{ type: 'text', text: input }] })
-    }
+    // The turn budget is per user request, not per session.
+    this.#turn = 0
+    // A previous run may have been cut off between a tool_use and its result.
+    this.#repairHistory()
+    if (input.trim()) this.#pushUserText(input)
 
-    while (this.#turn < MAX_TURNS) {
+    const maxTurns = this.#opts.maxTurns ?? DEFAULT_MAX_TURNS
+    while (this.#turn < maxTurns) {
       if (options.signal.aborted) {
         yield { type: 'done', stopReason: 'aborted' }
         return
@@ -150,18 +173,34 @@ export class AgentRuntime {
       this.#turn++
       yield { type: 'turn_start', turn: this.#turn }
 
-      const systemPrompt = buildSystemPrompt({
-        ...this.#opts.promptContext,
-        tools: this.#opts.tools,
-        effort: this.#opts.effort,
-        skills: skillRegistry.findRelevant(input, 2),
-      })
+      // Compact before the request that would overflow, not after it failed.
+      const proactive = this.#maybeCompact()
+      if (proactive) yield proactive
+
+      // On the final permitted turn a finalising runtime asks for the report
+      // and offers no tools, so the model has no choice but to answer.
+      const finalTurn = this.#opts.finalizeOnLimit === true && this.#turn === maxTurns
+      if (finalTurn) {
+        this.#pushUserText(
+          'You are out of turns. Do not call any more tools. Write your final report now from what you have found so far, and say plainly what you did not get to.',
+        )
+      }
+
+      const systemPrompt =
+        this.#opts.systemText !== undefined
+          ? { text: this.#opts.systemText }
+          : buildSystemPrompt({
+              ...this.#opts.promptContext,
+              tools: this.#opts.tools,
+              effort: this.#opts.effort,
+              skills: skillRegistry.findRelevant(input, 2),
+            })
 
       const request = {
         model: this.#opts.model,
         system: systemPrompt,
         messages: this.#messages,
-        tools: this.#opts.tools.modelTools(),
+        tools: finalTurn ? [] : this.#opts.tools.modelTools(),
         effort: this.#opts.effort.main,
         signal: options.signal,
       }
@@ -169,6 +208,8 @@ export class AgentRuntime {
       // --- stream one model turn -------------------------------------------
       const assistantContent: ContentBlock[] = []
       const toolUses: ToolUseBlock[] = []
+      let thinkingBuffer = ''
+      let thinkingSignature: string | undefined
       let stopReason: StopReason = 'end_turn'
       let turnUsage: Usage = { inputTokens: 0, outputTokens: 0 }
       let textBuffer = ''
@@ -182,7 +223,11 @@ export class AgentRuntime {
               yield { type: 'text_delta', text: event.text }
               break
             case 'thinking_delta':
+              thinkingBuffer += event.thinking
               yield { type: 'thinking_delta', text: event.thinking }
+              break
+            case 'thinking_signature':
+              thinkingSignature = event.signature
               break
             case 'citation_delta':
               if (event.citation.url) {
@@ -199,6 +244,7 @@ export class AgentRuntime {
                 id: event.id,
                 name: event.name,
                 input: event.input,
+                ...(event.providerMeta ? { providerMeta: event.providerMeta } : {}),
               })
               break
             case 'usage':
@@ -236,8 +282,20 @@ export class AgentRuntime {
 
       // Flush the buffered text as one block so the model sees a coherent
       // assistant message rather than a stream of fragments.
+      // A signed thinking block must be replayed first and unmodified when
+      // tools are used; unsigned reasoning is display-only and never stored.
+      if (thinkingBuffer && thinkingSignature) {
+        assistantContent.push({
+          type: 'thinking',
+          thinking: thinkingBuffer,
+          signature: thinkingSignature,
+        })
+      }
       if (textBuffer) assistantContent.push({ type: 'text', text: textBuffer })
-      for (const use of toolUses) assistantContent.push(use)
+      // Tool calls from a truncated or cancelled turn may be incomplete. They are
+      // not run, and not kept: a tool_use with no result makes the history invalid.
+      const runnable = stopReason === 'max_tokens' || stopReason === 'aborted' ? [] : toolUses
+      for (const use of runnable) assistantContent.push(use)
 
       this.#usage = {
         inputTokens: this.#usage.inputTokens + turnUsage.inputTokens,
@@ -295,34 +353,42 @@ export class AgentRuntime {
       if (stopReason === 'pause_turn') {
         // A paused turn is not finished. Ask the model to carry on rather than
         // reporting completion the user would then have to trigger again.
-        this.#messages.push({
-          role: 'user',
-          content: [{ type: 'text', text: 'Continue.' }],
-        })
+        this.#pushUserText('Continue.')
         continue
       }
       if (stopReason === 'max_tokens' && toolUses.length > 0) {
+        yield {
+          type: 'notice',
+          level: 'warn',
+          text: 'The model hit its output limit in the middle of a tool call; asking it to retry.',
+        }
         // Truncated tool JSON is not runnable. Say so instead of executing it.
-        this.#messages.push({
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: 'Your last message was cut off before the tool call finished. Re-issue the tool call with fewer arguments.',
-            },
-          ],
-        })
+        this.#pushUserText(
+          'Your last message was cut off before the tool call finished. Re-issue the tool call with fewer arguments.',
+        )
         continue
       }
-      if (toolUses.length === 0) {
+      if (runnable.length === 0) {
         this.#setState('done')
         break
       }
 
       // --- run the tools the model asked for --------------------------------
       this.#setState('acting')
-      const results = yield* this.#runTools(toolUses, options)
+      const results = yield* this.#runTools(runnable, options)
       this.#messages.push({ role: 'user', content: results })
+      if (options.signal.aborted) {
+        yield { type: 'done', stopReason: 'aborted' }
+        return
+      }
+    }
+
+    if (this.#turn >= maxTurns && this.#state !== 'done') {
+      yield {
+        type: 'notice',
+        level: 'warn',
+        text: `Stopped after ${maxTurns} model turns in one request. Say "continue" to keep going.`,
+      }
     }
 
     this.#setState('done')
@@ -342,7 +408,7 @@ export class AgentRuntime {
     options: RunOptions,
   ): AsyncGenerator<AgentEvent, ContentBlock[]> {
     const results: ContentBlock[] = []
-    const approved: Array<{ use: ToolUseBlock; display: string }> = []
+    const approved: Array<{ use: ToolUseBlock; display: string; input: unknown }> = []
 
     for (const use of toolUses) {
       const tool = this.#opts.tools.get(use.name)
@@ -384,7 +450,7 @@ export class AgentRuntime {
         continue
       }
 
-      const ctx = this.#toolContext()
+      const ctx = this.#toolContext(options.signal)
       let display = use.name
       try {
         const action = tool.plan(input as never, ctx)
@@ -410,10 +476,19 @@ export class AgentRuntime {
           continue
         }
         display = action.command ? `run ${truncate(action.command, 50)}` : `${use.name}`
-        approved.push({ use, display })
+        approved.push({ use, display, input })
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         results.push(toolResult(use.id, `Could not plan ${use.name}: ${message}`, true))
+        yield {
+          type: 'tool_end',
+          id: use.id,
+          name: use.name,
+          display: `${use.name} (failed)`,
+          isError: true,
+          durationMs: 0,
+          summary: 'could not plan',
+        }
       }
     }
 
@@ -427,8 +502,12 @@ export class AgentRuntime {
     // Tools emit progress from inside their own async execution, so it is
     // funnelled through a queue and drained here in arrival order.
     const progress = new AsyncQueue<AgentEvent>()
-    const executions = approved.map(({ use, display }) => this.#executeOne(use, display, progress))
-    const settled = Promise.allSettled(executions)
+    const executions = approved.map(({ use, display, input }) =>
+      this.#executeOne(use, display, input, progress, options.signal),
+    )
+    // The queue closes once *every* tool has finished. Closing on the first one
+    // would drop the progress of the rest.
+    const settled = Promise.allSettled(executions).finally(() => progress.close())
 
     for await (const event of progress.drain()) {
       yield event
@@ -458,14 +537,31 @@ export class AgentRuntime {
       }
     }
 
-    void options
+    // Every tool_use needs exactly one result, whatever happened to it; a gap
+    // makes the whole conversation unsendable.
+    const answered = new Set(
+      results.flatMap((b) => (b.type === 'tool_result' ? [b.toolUseId] : [])),
+    )
+    for (const use of toolUses) {
+      if (!answered.has(use.id)) {
+        results.push(toolResult(use.id, `${use.name} did not produce a result.`, true))
+      }
+    }
+    const order = new Map(toolUses.map((u, i) => [u.id, i]))
+    results.sort(
+      (a, b) =>
+        (a.type === 'tool_result' ? (order.get(a.toolUseId) ?? 0) : 0) -
+        (b.type === 'tool_result' ? (order.get(b.toolUseId) ?? 0) : 0),
+    )
     return results
   }
 
   async #executeOne(
     use: ToolUseBlock,
     display: string,
+    input: unknown,
     progress: AsyncQueue<AgentEvent>,
+    signal: AbortSignal,
   ): Promise<{
     use: ToolUseBlock
     display: string
@@ -475,7 +571,7 @@ export class AgentRuntime {
     const tool = this.#opts.tools.get(use.name)
     if (!tool) return null
     const started = Date.now()
-    const ctx = this.#toolContext((event) => {
+    const ctx = this.#toolContext(signal, (event) => {
       // A plan update is session-level UI state, not tool-local output, so it
       // is promoted to its own event rather than shown as tool chatter.
       if (event.type === 'plan') {
@@ -485,7 +581,7 @@ export class AgentRuntime {
       progress.push({ type: 'tool_progress', id: use.id, event })
     })
     try {
-      const result = await tool.execute(use.input as never, ctx)
+      const result = await tool.execute(input as never, ctx)
       return { use, display, result, durationMs: Date.now() - started }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -495,12 +591,10 @@ export class AgentRuntime {
         result: { content: `Error: ${message}`, isError: true },
         durationMs: Date.now() - started,
       }
-    } finally {
-      progress.close()
     }
   }
 
-  #toolContext(onEvent?: (event: ToolEvent) => void): ToolContext {
+  #toolContext(signal: AbortSignal, onEvent?: (event: ToolEvent) => void): ToolContext {
     return {
       cwd: this.#opts.promptContext.workspaceRoot,
       workspaceRoot: this.#opts.promptContext.workspaceRoot,
@@ -508,13 +602,12 @@ export class AgentRuntime {
       sandbox: this.#opts.sandbox,
       logger: this.#opts.logger,
       sessionId: this.#opts.sessionId,
-      signal: new AbortController().signal,
+      signal,
       emit: (event: ToolEvent) => {
         onEvent?.(event)
       },
-      noteFileChange: (path: string) => {
-        this.#changedFiles.add(path)
-      },
+      web: this.#opts.web,
+      noteFileChange: (path: string) => this.trackFile(path),
     }
   }
 
@@ -522,26 +615,103 @@ export class AgentRuntime {
     this.#state = state
   }
 
+  /** Append user text, merging into a trailing user turn so roles keep alternating. */
+  #pushUserText(text: string): void {
+    const last = this.#messages.at(-1)
+    if (last?.role === 'user') {
+      this.#messages[this.#messages.length - 1] = {
+        role: 'user',
+        content: [...last.content, { type: 'text', text }],
+      }
+      return
+    }
+    this.#messages.push({ role: 'user', content: [{ type: 'text', text }] })
+  }
+
+  /**
+   * Make the stored conversation valid to send.
+   *
+   * A run cut off by Esc, a crash, or a resumed session can leave an assistant
+   * `tool_use` with no matching result. Every provider rejects that, so the gap
+   * is filled with an explicit "interrupted" result.
+   */
+  #repairHistory(): void {
+    const repaired: AgentMessage[] = []
+    for (let i = 0; i < this.#messages.length; i++) {
+      const message = this.#messages[i] as AgentMessage
+      repaired.push(message)
+      if (message.role !== 'assistant' || typeof message.content === 'string') continue
+      const uses = message.content.filter((b): b is ToolUseBlock => b.type === 'tool_use')
+      if (uses.length === 0) continue
+      const next = this.#messages[i + 1]
+      const answered = new Set(
+        next?.role === 'user'
+          ? next.content.flatMap((b) => (b.type === 'tool_result' ? [b.toolUseId] : []))
+          : [],
+      )
+      const missing = uses.filter((u) => !answered.has(u.id))
+      if (missing.length === 0) continue
+      const fill = missing.map((u) =>
+        toolResult(u.id, 'This tool call was interrupted before it finished.', true),
+      )
+      if (next?.role === 'user') {
+        this.#messages[i + 1] = { role: 'user', content: [...fill, ...next.content] }
+      } else {
+        repaired.push({ role: 'user', content: fill })
+      }
+    }
+    this.#messages = repaired
+  }
+
+  #contextLimit(): number {
+    const window = this.#opts.provider.resolveModel(this.#opts.model)?.contextWindow ?? 200_000
+    return this.#opts.contextLimitTokens ?? Math.floor(window * 0.8)
+  }
+
+  #maybeCompact(): AgentEvent | null {
+    if (estimateTokens(this.#messages) < this.#contextLimit()) return null
+    const result = this.compact()
+    if (!result.didCompact) return null
+    return {
+      type: 'context_compacted',
+      beforeTokens: result.beforeTokens,
+      afterTokens: result.afterTokens,
+    }
+  }
+
+  /** Shrink the transcript now. Used by `/compact`, and automatically near the limit. */
+  compact(): { didCompact: boolean; beforeTokens: number; afterTokens: number } {
+    return this.#compactContext()
+  }
+
   /**
    * Shrink the transcript when it outgrows the window.
    *
-   * The recent window is kept verbatim because verbatim tool results are what
-   * the model needs to continue correctly. Older turns are dropped first, and
-   * only as a last resort is a summary substituted.
+   * The first message (the task) and the most recent exchanges are kept
+   * verbatim, because verbatim tool results are what the model needs to
+   * continue correctly. The middle is replaced by a short digest. The cut is
+   * always placed at a plain user message so a tool_use is never separated from
+   * its result.
    */
   #compactContext(): { didCompact: boolean; beforeTokens: number; afterTokens: number } {
     const before = estimateTokens(this.#messages)
-    if (this.#messages.length <= 4)
-      return { didCompact: false, beforeTokens: before, afterTokens: before }
+    const none = { didCompact: false, beforeTokens: before, afterTokens: before }
+    const keep = 6
+    let cut = this.#messages.length - keep
+    const isPlainUser = (m: AgentMessage | undefined) =>
+      m?.role === 'user' && !m.content.some((b) => b.type === 'tool_result')
+    while (cut > 1 && !isPlainUser(this.#messages[cut])) cut--
+    if (cut <= 1) return none
 
-    const keep = 4
-    const _dropped = this.#messages.length - keep
-    const head = this.#messages.slice(0, 1)
-    const tail = this.#messages.slice(-keep)
-    const summary = summariseDropped(this.#messages.slice(1, -keep))
-    this.#messages = [...head, summary, ...tail]
-    const after = estimateTokens(this.#messages)
-    return { didCompact: true, beforeTokens: before, afterTokens: after }
+    const first = this.#messages[0] as AgentMessage
+    const tailFirst = this.#messages[cut] as AgentMessage
+    const digest = summariseDropped(this.#messages.slice(1, cut))
+    const merged: AgentMessage = {
+      role: 'user',
+      content: [...first.content, ...digest.content, ...tailFirst.content],
+    }
+    this.#messages = [merged, ...this.#messages.slice(cut + 1)]
+    return { didCompact: true, beforeTokens: before, afterTokens: estimateTokens(this.#messages) }
   }
 }
 
