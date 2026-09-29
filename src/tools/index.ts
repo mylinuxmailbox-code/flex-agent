@@ -3,6 +3,7 @@ import { fileInfoTool, globTool, listDirectoryTool } from './filesystem/list.js'
 import { deleteFileTool, moveFileTool } from './filesystem/mutate.js'
 import { readFileTool } from './filesystem/read.js'
 import { searchRegexTool, searchTextTool } from './filesystem/search.js'
+import { findSymbolTool } from './filesystem/symbols.js'
 import { gitDiffTool, gitLogTool, gitStatusTool } from './git/index.js'
 import { recallTool, rememberTool } from './memory/index.js'
 import { todoTool } from './planning/todo.js'
@@ -28,6 +29,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     // search
     searchTextTool,
     searchRegexTool,
+    findSymbolTool,
     // filesystem — write
     editFileTool,
     writeFileTool,

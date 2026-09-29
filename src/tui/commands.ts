@@ -20,7 +20,8 @@ export interface CommandContext {
   /** `/permissions` — with no argument shows state; with `ask|auto|full-control` switches. */
   permissions(arg: string): void
   showStatus(): void
-  showDiff(): void
+  showContext(): void
+  showDiff(path: string): void
   showPlan(): void
   runTests(): void
   compact(): void
@@ -135,8 +136,8 @@ const COMMAND_LIST: Command[] = [
   },
   {
     name: 'context',
-    summary: 'Show context usage',
-    run: (_args, ctx) => ctx.showStatus(),
+    summary: 'Show how much of the context window the conversation uses',
+    run: (_args, ctx) => ctx.showContext(),
   },
   {
     name: 'status',
@@ -156,7 +157,9 @@ const COMMAND_LIST: Command[] = [
   {
     name: 'diff',
     summary: 'Show the working-tree diff',
-    run: (_args, ctx) => ctx.showDiff(),
+    args: '[path]',
+    detail: 'Shows unstaged changes (long diffs are truncated) and lists untracked files.',
+    run: (args, ctx) => ctx.showDiff(args.trim()),
   },
   {
     name: 'review',

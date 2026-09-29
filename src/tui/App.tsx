@@ -1,6 +1,7 @@
 import { Box, Text, useApp, useInput, useWindowSize } from 'ink'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AgentEvent } from '../agent/events.js'
+import { estimateTokens } from '../agent/runtime/loop.js'
 import { describeConfig } from '../config/index.js'
 import type { EffortLevel } from '../models/types.js'
 import { EFFORT_LEVELS, effortProfile } from '../models/types.js'
@@ -368,20 +369,47 @@ function commandContext(
       )
     },
 
-    showDiff() {
-      void session.gitStatus().then((stat) => {
-        if (!stat) {
+    showContext() {
+      const used = estimateTokens(session.runtime.messages)
+      const window = session.contextWindow
+      const pct = Math.min(100, Math.round((used / window) * 100))
+      const bar = `${'█'.repeat(Math.round(pct / 5))}${'░'.repeat(20 - Math.round(pct / 5))}`
+      const usage = session.runtime.usage
+      store.addNotice(
+        'info',
+        [
+          `Context: ~${used.toLocaleString()} of ${window.toLocaleString()} tokens (${pct}%)`,
+          bar,
+          `Messages: ${session.runtime.messages.length}`,
+          `Session totals: ${usage.inputTokens.toLocaleString()} in / ${usage.outputTokens.toLocaleString()} out`,
+          pct >= 70 ? 'Running full. /compact frees space; /clear starts over.' : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      )
+    },
+
+    showDiff(path) {
+      void session.gitDiff(path || undefined).then((result) => {
+        if (!result) {
           store.addNotice('error', 'Could not read git state — is this a git repository?')
           return
         }
-        if (stat.files === 0) {
-          store.addNotice('info', 'No unstaged changes.')
+        if (!result.diff && result.untracked.length === 0) {
+          store.addNotice('info', 'No changes in the working tree.')
           return
         }
-        store.addNotice(
-          'info',
-          `${stat.files} file(s) changed  +${stat.insertions} -${stat.deletions}\nAsk the agent to show a specific diff, or use \`git diff <path>\` in another terminal.`,
-        )
+        const parts: string[] = []
+        if (result.diff) parts.push(result.diff)
+        if (result.untracked.length > 0) {
+          parts.push(
+            `Untracked (${result.untracked.length}):\n${result.untracked
+              .slice(0, 20)
+              .map((f) => `  ${f}`)
+              .join('\n')}`,
+          )
+        }
+        store.addNotice('info', parts.join('\n\n'))
       })
     },
 

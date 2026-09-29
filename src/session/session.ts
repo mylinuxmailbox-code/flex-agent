@@ -551,6 +551,32 @@ export class Session {
 
   // --- helpers used by the TUI ---------------------------------------------
 
+  /** Unstaged diff (truncated) and untracked files, for `/diff`. Null outside a repository. */
+  async gitDiff(path?: string): Promise<{ diff: string; untracked: string[] } | null> {
+    const cwd = this.config.workspaceRoot
+    try {
+      const args = ['diff', '--no-color', '--no-ext-diff', ...(path ? ['--', path] : [])]
+      const [diff, untracked] = await Promise.all([
+        execa('git', args, { cwd, reject: false, timeout: 10_000 }),
+        execa('git', ['ls-files', '--others', '--exclude-standard'], {
+          cwd,
+          reject: false,
+          timeout: 10_000,
+        }),
+      ])
+      if (diff.exitCode !== 0) return null
+      const lines = diff.stdout.split('\n')
+      const MAX_LINES = 200
+      const text =
+        lines.length > MAX_LINES
+          ? `${lines.slice(0, MAX_LINES).join('\n')}\n… ${lines.length - MAX_LINES} more lines (use \`git diff\` for the rest)`
+          : diff.stdout
+      return { diff: text.trim(), untracked: untracked.stdout.split('\n').filter(Boolean) }
+    } catch {
+      return null
+    }
+  }
+
   async gitStatus(): Promise<{ files: number; insertions: number; deletions: number } | null> {
     try {
       const { stdout } = await execa('git', ['diff', '--numstat'], {

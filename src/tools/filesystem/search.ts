@@ -48,9 +48,9 @@ function searchInput(description: string) {
   })
 }
 
-type SearchInput = z.output<ReturnType<typeof searchInput>>
+export type SearchInput = z.output<ReturnType<typeof searchInput>>
 
-async function runSearch(
+export async function runSearch(
   input: SearchInput,
   ctx: Parameters<Tool['execute']>[1],
   fixedStrings: boolean,

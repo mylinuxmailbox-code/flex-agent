@@ -7,6 +7,7 @@ import { deleteFileTool, moveFileTool } from '../src/tools/filesystem/mutate.js'
 import { PathError, resolvePath } from '../src/tools/filesystem/paths.js'
 import { searchRegexTool, searchTextTool } from '../src/tools/filesystem/search.js'
 import { SnapshotManager } from '../src/tools/filesystem/snapshots.js'
+import { findSymbolTool } from '../src/tools/filesystem/symbols.js'
 import { gitDiffTool, gitLogTool, gitStatusTool } from '../src/tools/git/index.js'
 import {
   checkOutputTool,
@@ -297,5 +298,80 @@ describe('git tools', () => {
   it('fails cleanly outside a repository', async () => {
     const status = await gitStatusTool.execute({}, ws.ctx)
     expect(status.isError).toBe(true)
+  })
+})
+
+describe('find_symbol', () => {
+  beforeEach(() => {
+    writeFileSync(
+      join(ws.root, 'a.ts'),
+      [
+        'export async function fetchUser(id: string) {',
+        '  return db.get(id)',
+        '}',
+        'export class UserService {',
+        '  async loadUser(id: string): Promise<User> {',
+        '    return fetchUser(id)',
+        '  }',
+        '}',
+        'export const makeThing = (x: number) => x * 2',
+        'export interface UserRecord { id: string }',
+        'type Alias = string',
+      ].join('\n'),
+    )
+    writeFileSync(
+      join(ws.root, 'b.py'),
+      'class Repo:\n    def save_user(self, u):\n        pass\n\nMAX_USERS = 10\n',
+    )
+    writeFileSync(
+      join(ws.root, 'c.go'),
+      'package x\nfunc (s *Server) Handle(w int) {}\nfunc Plain() {}\n',
+    )
+    writeFileSync(join(ws.root, 'd.rs'), 'pub fn parse_line() {}\npub struct Token;\n')
+  })
+
+  const def = (symbol: string) => findSymbolTool.execute({ symbol }, ws.ctx)
+
+  it.each([
+    ['fetchUser', 'a.ts:1'],
+    ['UserService', 'a.ts:4'],
+    ['loadUser', 'a.ts:5'],
+    ['makeThing', 'a.ts:9'],
+    ['UserRecord', 'a.ts:10'],
+    ['Alias', 'a.ts:11'],
+    ['Repo', 'b.py:1'],
+    ['save_user', 'b.py:2'],
+    ['MAX_USERS', 'b.py:5'],
+    ['Handle', 'c.go:2'],
+    ['Plain', 'c.go:3'],
+    ['parse_line', 'd.rs:1'],
+    ['Token', 'd.rs:2'],
+  ])('finds the definition of %s', async (symbol, where) => {
+    const r = await def(symbol)
+    expect(r.isError).toBeFalsy()
+    expect(r.content).toContain(where)
+  })
+
+  it('does not report a call site as a definition', async () => {
+    const r = await def('fetchUser')
+    expect(r.content).not.toContain('a.ts:6')
+  })
+
+  it('finds references, including call sites', async () => {
+    const r = await findSymbolTool.execute({ symbol: 'fetchUser', mode: 'references' }, ws.ctx)
+    expect(r.content).toContain('a.ts:1')
+    expect(r.content).toContain('a.ts:6')
+  })
+
+  it('does not match a longer identifier that merely contains the symbol', async () => {
+    const r = await findSymbolTool.execute({ symbol: 'User', mode: 'references' }, ws.ctx)
+    expect(r.content).not.toContain('a.ts:1:') // fetchUser only
+  })
+
+  it('reports a miss clearly and rejects non-identifiers', async () => {
+    const miss = await def('doesNotExist')
+    expect(miss.isError).toBe(true)
+    expect(miss.content).toMatch(/No definition found/)
+    expect(() => findSymbolTool.inputSchema.parse({ symbol: 'a b' })).toThrow()
   })
 })
