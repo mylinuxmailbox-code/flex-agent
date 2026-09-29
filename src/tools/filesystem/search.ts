@@ -87,7 +87,7 @@ async function runSearch(
   try {
     const result = await execa('rg', args, {
       cwd: ctx.workspaceRoot,
-      signal: ctx.signal,
+      cancelSignal: ctx.signal,
       maxBuffer: 32 * 1024 * 1024,
       reject: false,
     })

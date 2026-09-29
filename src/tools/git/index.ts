@@ -18,7 +18,7 @@ const GIT_TIMEOUT = 15_000
 async function git(cwd: string, args: string[], signal?: AbortSignal) {
   return execa('git', args, {
     cwd,
-    signal,
+    cancelSignal: signal,
     timeout: GIT_TIMEOUT,
     reject: false,
     maxBuffer: 16 * 1024 * 1024,
