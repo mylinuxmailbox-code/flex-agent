@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { DEFAULT_DENY_PATHS, expandPath, type Sandbox } from '../../sandbox/types.js'
 
 /**
@@ -39,41 +40,71 @@ export function resolvePath(
   const expanded = expandPath(rawPath.trim())
   const abs = isAbsolute(expanded) ? resolve(expanded) : resolve(ctx.workspaceRoot, expanded)
 
-  if (abs !== '/' && abs.endsWith(sep)) return abs.slice(0, -1)
+  // Containment is judged on the *real* location. A symlink inside the workspace
+  // that points at ~/.ssh is not inside the workspace.
+  const real = realLocation(abs.length > 1 && abs.endsWith(sep) ? abs.slice(0, -1) : abs)
 
   if (mustBeInWorkspace) {
     const roots = [ctx.workspaceRoot]
     if (allowScratch && ctx.sandbox) {
       roots.push(...ctx.sandbox.writableRoots())
     }
-    if (!roots.some((root) => isInside(abs, root))) {
-      throw new PathError(`path escapes the workspace: ${rawPath} (resolved to ${abs})`, rawPath)
+    const realRoots = roots.flatMap((r) => [resolve(r), realLocation(resolve(r))])
+    if (!realRoots.some((root) => isInside(real, root))) {
+      throw new PathError(`path escapes the workspace: ${rawPath} (resolved to ${real})`, rawPath)
     }
   }
 
-  const denied = DEFAULT_DENY_PATHS.map((p) => expandPath(p))
-  if (denied.some((d) => isInside(abs, d))) {
+  const denied = DEFAULT_DENY_PATHS.map((p) => expandPath(p)).flatMap((p) => [p, realLocation(p)])
+  if (denied.some((d) => isInside(real, d))) {
     throw new PathError(`path is in a protected location: ${rawPath}`, rawPath)
   }
 
-  if (ctx.sandbox && mustExist && !ctx.sandbox.canRead(abs)) {
+  if (mustExist && !existsSync(real)) {
+    throw new PathError(`not found: ${rawPath} does not exist`, rawPath)
+  }
+
+  if (ctx.sandbox && mustExist && !ctx.sandbox.canRead(real)) {
     throw new PathError(`sandbox policy does not permit reading ${rawPath}`, rawPath)
   }
 
-  return abs
+  return real
+}
+
+/**
+ * The path with every existing symlink resolved. The tail that does not exist
+ * yet (a file about to be created) is appended unchanged, so this works for
+ * writes as well as reads.
+ */
+export function realLocation(path: string): string {
+  let existing = resolve(path)
+  const tail: string[] = []
+  while (!existsSync(existing)) {
+    const parent = resolve(existing, '..')
+    if (parent === existing) return resolve(path)
+    tail.unshift(existing.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)))
+    existing = parent
+  }
+  try {
+    return join(realpathSync(existing), ...tail)
+  } catch {
+    return resolve(path)
+  }
 }
 
 /** True when `child` is `parent` or lives under it. */
 export function isInside(child: string, parent: string): boolean {
   const rel = relative(resolve(parent), resolve(child))
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  if (rel === '') return true
+  // `..foo` is a legitimate directory name; only `..` and `../x` escape.
+  return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
 
 /** Present an absolute path back to the user the way they typed it. */
 export function toDisplayPath(absPath: string, workspaceRoot: string): string {
   const rel = relative(workspaceRoot, absPath)
   if (rel === '') return '.'
-  if (rel.startsWith('..')) return absPath
+  if (rel === '..' || rel.startsWith(`..${sep}`)) return absPath
   return rel.split(sep).join('/')
 }
 

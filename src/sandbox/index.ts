@@ -48,7 +48,7 @@ export async function createSandbox(request: SandboxRequest): Promise<SandboxRes
 
   if (request.disabled) {
     return {
-      sandbox: await new NoSandboxBackend().create(policy, request.logger),
+      sandbox: await new NoSandboxBackend({ scrubEnv: false }).create(policy, request.logger),
       reason: 'sandboxing disabled for this session',
     }
   }

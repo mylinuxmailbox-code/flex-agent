@@ -1,12 +1,16 @@
 import { execa } from 'execa'
 import type { Logger } from '../../observability/logger.js'
-import type {
-  ExecHandle,
-  ExecSpec,
-  Sandbox,
-  SandboxBackend,
-  SandboxInfo,
-  SandboxPolicy,
+import { scrubEnv } from '../env.js'
+import { isUnder, spawnDetached } from '../process.js'
+import {
+  type ExecHandle,
+  type ExecSpec,
+  expandPath,
+  type Sandbox,
+  type SandboxBackend,
+  type SandboxInfo,
+  type SandboxPolicy,
+  type SpawnedProcess,
 } from '../types.js'
 
 /**
@@ -19,12 +23,19 @@ import type {
 export class NoSandboxBackend implements SandboxBackend {
   readonly name = 'none'
 
+  /**
+   * `scrubEnv` drops secret-shaped variables from what commands see. It is on
+   * for the "no backend available" fallback, and off for `--full-control`,
+   * where the user asked for the command to run exactly as they would.
+   */
+  constructor(private readonly options: { scrubEnv?: boolean } = {}) {}
+
   async probe(): Promise<{ usable: boolean; detail: string }> {
     return { usable: true, detail: 'commands run directly on the host' }
   }
 
   async create(policy: SandboxPolicy, logger: Logger): Promise<Sandbox> {
-    return new NoSandbox(policy, logger)
+    return new NoSandbox(policy, logger, this.options.scrubEnv ?? true)
   }
 }
 
@@ -33,9 +44,12 @@ class NoSandbox implements Sandbox {
   readonly info: SandboxInfo
   readonly #logger: Logger
 
-  constructor(policy: SandboxPolicy, logger: Logger) {
+  readonly #scrub: boolean
+
+  constructor(policy: SandboxPolicy, logger: Logger, scrub: boolean) {
     this.policy = policy
     this.#logger = logger
+    this.#scrub = scrub
     this.info = {
       backend: 'none',
       status: 'unavailable',
@@ -50,12 +64,24 @@ class NoSandbox implements Sandbox {
     return this.policy.writeRoots
   }
 
-  canRead(): boolean {
-    return true
+  canRead(path: string): boolean {
+    return !this.policy.denyPaths.some((d) => isUnder(path, expandPath(d)))
   }
 
   canWrite(path: string): boolean {
-    return !this.policy.denyWritePaths.some((d) => path.startsWith(d))
+    return !this.policy.denyWritePaths.some((d) => isUnder(path, expandPath(d)))
+  }
+
+  #env(spec: ExecSpec): Record<string, string | undefined> {
+    const merged = { ...process.env, ...spec.env }
+    return this.#scrub ? scrubEnv(merged) : merged
+  }
+
+  spawn(
+    spec: ExecSpec,
+    onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
+  ): SpawnedProcess {
+    return spawnDetached([spec.command, ...spec.args], spec.cwd, this.#env(spec), onOutput)
   }
 
   describe(spec: ExecSpec): { argv: string[]; wrapped: boolean } {
@@ -75,11 +101,13 @@ class NoSandbox implements Sandbox {
     try {
       const subprocess = execa(spec.command, [...spec.args], {
         cwd: spec.cwd,
-        env: { ...process.env, ...spec.env },
+        env: this.#env(spec) as Record<string, string>,
+        extendEnv: false,
         timeout: spec.timeoutMs ?? this.policy.limits.wallClockMs,
         reject: false,
         input: spec.stdin,
         buffer: false,
+        ...(spec.signal ? { cancelSignal: spec.signal } : {}),
       })
       const childPid = subprocess.pid
       subprocess.stdout?.on('data', (c: Buffer) => {

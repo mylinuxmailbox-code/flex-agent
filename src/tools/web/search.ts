@@ -1,8 +1,8 @@
 /**
  * web_search tool.
  *
- * Searches the web using the best available provider (Brave if BRAVE_API_KEY
- * is set, DuckDuckGo HTML scraper otherwise). Results are returned as a
+ * Searches the web using the configured provider (`web.provider`; `auto` picks
+ * Brave, Tavily or Exa from the environment, else DuckDuckGo). Results are returned as a
  * formatted list with URLs, titles, and snippets.
  *
  * Risk: network-external, read-only. Safe to auto-approve.
@@ -13,6 +13,7 @@ import type { ActionDescription } from '../../permissions/types.js'
 import type { Tool } from '../types.js'
 import { errorResult, fail, ok, type ToolContext, type ToolResult } from '../types.js'
 import { createSearchProvider } from './providers.js'
+import type { SearchResult, WebSearchProvider } from './types.js'
 
 const inputSchema = z.object({
   query: z.string().min(1).describe('The search query.'),
@@ -22,8 +23,7 @@ const inputSchema = z.object({
     .min(1)
     .max(20)
     .optional()
-    .default(8)
-    .describe('Maximum number of results (default 8, max 20).'),
+    .describe('Maximum number of results (default 8, capped by web.maxResults).'),
   allow_domains: z
     .array(z.string())
     .optional()
@@ -65,15 +65,27 @@ export const webSearchTool: Tool<typeof inputSchema> = {
   async execute(input, ctx: ToolContext): Promise<ToolResult> {
     ctx.emit({ type: 'status', text: `Searching: ${input.query}` })
 
-    const provider = createSearchProvider()
+    let provider: WebSearchProvider | null
+    try {
+      provider = createSearchProvider({ provider: ctx.web?.provider, apiKey: ctx.web?.apiKey })
+    } catch (err) {
+      return errorResult(err, 'search unavailable')
+    }
+    if (!provider)
+      return fail('Web search is disabled (web.provider is "none").', 'search disabled')
 
-    let results: Awaited<ReturnType<ReturnType<typeof createSearchProvider>['search']>>
+    // Config domain lists always apply; the model's lists narrow further.
+    const allowDomains = input.allow_domains?.length ? input.allow_domains : ctx.web?.allowedDomains
+    const blockDomains = [...(ctx.web?.blockedDomains ?? []), ...(input.block_domains ?? [])]
+    const limit = Math.min(input.limit ?? ctx.web?.maxResults ?? 8, ctx.web?.maxResults ?? 20)
+
+    let results: SearchResult[]
     try {
       results = await provider.search(input.query, {
-        limit: input.limit,
+        limit,
         locale: input.locale,
-        allowDomains: input.allow_domains,
-        blockDomains: input.block_domains,
+        allowDomains,
+        blockDomains,
       })
     } catch (err) {
       return errorResult(err, 'search failed')

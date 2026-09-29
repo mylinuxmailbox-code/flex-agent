@@ -602,7 +602,7 @@ describe('GoogleProvider (Gemini API against a local server)', () => {
 describe('Gemini wire helpers', () => {
   it('converts JSON Schema to the OpenAPI subset', () => {
     // biome-ignore lint/suspicious/noExplicitAny: loosely-typed schema tree
-    const schema = toGeminiSchema({
+    const schema: any = toGeminiSchema({
       $schema: 'x',
       type: 'object',
       properties: {
@@ -617,7 +617,7 @@ describe('Gemini wire helpers', () => {
       required: ['name', 'ghost'],
       additionalProperties: false,
       $defs: { Inner: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] } },
-    }) as Record<string, any>
+    })
     expect(schema.type).toBe('OBJECT')
     expect(schema.required).toEqual(['name'])
     expect(schema.properties.name).toEqual({ type: 'STRING', nullable: true, description: 'n' })

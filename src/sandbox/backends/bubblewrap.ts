@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execa } from 'execa'
 import type { Logger } from '../../observability/logger.js'
+import { scrubEnv } from '../env.js'
+import { isUnder, spawnDetached } from '../process.js'
 import {
   type ExecHandle,
   type ExecSpec,
@@ -11,6 +13,7 @@ import {
   type SandboxBackend,
   type SandboxInfo,
   type SandboxPolicy,
+  type SpawnedProcess,
 } from '../types.js'
 
 /**
@@ -27,10 +30,6 @@ import {
 
 const BIN = '/usr/bin/bwrap'
 const PRLIMIT = '/usr/bin/prlimit'
-
-/** Env var names that must never reach a command the model chose. */
-const SECRET_NAME_RE =
-  /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|SESSION|COOKIE|PRIVATE|CERT|DSN|^PAT$|^GH_|^GITHUB_|^AWS_|^AZURE_|^GCP_|^GOOGLE_|^OPENAI_|^ANTHROPIC_|^CLAUDE_|^NPM_|^DOCKER_|^STRIPE_|^SLACK_|^SENDGRID_|^TWILIO_)/i
 
 export interface BubblewrapOptions {
   /** Keep the user in their real $HOME. Off by default — see below. */
@@ -173,6 +172,7 @@ class BubblewrapSandbox implements Sandbox {
         stripFinalNewline: false,
         input: spec.stdin,
         buffer: false,
+        ...(spec.signal ? { cancelSignal: spec.signal } : {}),
       })
       const childPid = subprocess.pid
 
@@ -221,6 +221,15 @@ class BubblewrapSandbox implements Sandbox {
         timedOut: false,
       }
     }
+  }
+
+  spawn(
+    spec: ExecSpec,
+    onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
+  ): SpawnedProcess {
+    const argv = spec.bypass ? [spec.command, ...spec.args] : this.#argv(spec)
+    const env = spec.bypass ? (spec.env ?? process.env) : this.#childEnv(spec)
+    return spawnDetached(argv, spec.cwd, env, onOutput)
   }
 
   /** Full argv for a command, wrapper included. Used in permission previews. */
@@ -305,15 +314,7 @@ class BubblewrapSandbox implements Sandbox {
    * print the user's API keys.
    */
   #childEnv(spec: ExecSpec): Record<string, string> {
-    const source = spec.env ?? process.env
-    const out: Record<string, string> = {}
-    const passthrough = new Set(this.#opts.envPassthrough ?? [])
-    for (const [key, value] of Object.entries(source)) {
-      if (value === undefined) continue
-      if (passthrough.has(key) || !SECRET_NAME_RE.test(key)) {
-        out[key] = value
-      }
-    }
+    const out = scrubEnv(spec.env ?? process.env, this.#opts.envPassthrough)
     out.HOME = this.#sandboxHome
     out.FLEX_SANDBOX = '1'
     if (this.policy.network.mode === 'disabled') {
@@ -324,13 +325,6 @@ class BubblewrapSandbox implements Sandbox {
     }
     return out
   }
-}
-
-/** True when `child` is `parent` or lives beneath it. Handles parent === '/'. */
-function isUnder(child: string, parent: string): boolean {
-  if (parent === '/') return child.startsWith('/')
-  if (child === parent) return true
-  return child.startsWith(`${parent}/`)
 }
 
 /** `statSync` that answers "does not exist" with null instead of throwing. */

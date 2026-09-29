@@ -25,11 +25,12 @@ function searchInput(description: string) {
       .string()
       .optional()
       .describe('Restrict to files matching this glob, e.g. `*.ts` or `src/**/*.{ts,tsx}`.'),
-    case_sensitive: z.boolean().optional().describe('Match case exactly. Default false.'),
-    ignore_case_sensitive: z
+    case_sensitive: z
       .boolean()
       .optional()
-      .describe('Set false for case-insensitive matching. Default true (case-insensitive).'),
+      .describe(
+        'Match case exactly. Default: smart-case (case-insensitive unless the pattern has an uppercase letter).',
+      ),
     max_results: z
       .number()
       .int()
@@ -65,17 +66,22 @@ async function runSearch(
   const max = input.max_results ?? 100
   const args = [
     '--json',
+    // Per file, not overall: the overall cap is applied below.
     '--max-count',
-    '200',
-    fixedStrings ? '--fixed-strings' : '--regexp',
+    String(Math.min(MAX_RESULTS, max)),
+    // A minified bundle's single 2MB line would otherwise flood the context.
+    '--max-columns',
+    '300',
     input.case_sensitive ? '--case-sensitive' : '--smart-case',
     '--hidden',
     '--glob',
-    '!.git/*',
+    '!**/.git/**',
   ]
+  if (fixedStrings) args.push('--fixed-strings')
   if (input.glob) args.push('--glob', input.glob)
   if (input.context_lines) args.push('--context', String(input.context_lines))
-  args.push('--', input.pattern, root)
+  // `-e` so a pattern that starts with `-` is a pattern, not a flag.
+  args.push('-e', input.pattern, '--', root)
 
   let stdout: string
   try {
@@ -110,9 +116,7 @@ async function runSearch(
   const shown = hits.slice(0, max)
   const body = shown
     .map((h) =>
-      h.isContext
-        ? `  ${h.path}:${h.line}: ${h.text}`
-        : `${h.path}:${h.line}: ${highlight(h.text, input.pattern, fixedStrings)}`,
+      h.isContext ? `  ${h.path}:${h.line}: ${h.text}` : `${h.path}:${h.line}: ${h.text}`,
     )
     .join('\n')
   const more =
@@ -168,18 +172,6 @@ function parseRgJson(stdout: string, base: string): RgHit[] {
     })
   }
   return hits
-}
-
-const BOLD = '\u001b[1m'
-const UNBOLD = '\u001b[22m'
-
-/** Cheap emphasis: bold the literal needle when we searched for a fixed string. */
-function highlight(text: string, pattern: string, fixed: boolean): string {
-  if (!fixed || !pattern) return text
-  const index = text.toLowerCase().indexOf(pattern.toLowerCase())
-  if (index === -1) return text
-  const end = index + pattern.length
-  return `${text.slice(0, index)}${BOLD}${text.slice(index, end)}${UNBOLD}${text.slice(end)}`
 }
 
 const textSchema = searchInput(

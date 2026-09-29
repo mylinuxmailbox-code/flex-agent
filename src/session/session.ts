@@ -25,6 +25,7 @@ import { createSandbox, flexDirs } from '../sandbox/index.js'
 import type { NetworkPolicy, Sandbox } from '../sandbox/types.js'
 import { registerBuiltinTools } from '../tools/index.js'
 import { ToolRegistry } from '../tools/registry.js'
+import { killAllBackground } from '../tools/shell/run.js'
 import { createSpawnSubagentTool } from '../tools/task/spawn.js'
 import { type PersistedSession, sessionPersistence } from './persistence.js'
 
@@ -422,6 +423,7 @@ export class Session {
   /** Release everything that outlives a turn: MCP server processes, background jobs. */
   async close(): Promise<void> {
     this.interrupt()
+    killAllBackground()
     await mcpManager.closeAll().catch(() => undefined)
   }
 

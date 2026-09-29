@@ -90,6 +90,8 @@ export interface ExecSpec {
   readonly env?: Readonly<Record<string, string>>
   readonly timeoutMs?: number
   readonly stdin?: string
+  /** Kill the command when this aborts (Esc). */
+  readonly signal?: AbortSignal
   /** Strip the sandbox wrapper and run on the host directly. Only full-control does this. */
   readonly bypass?: boolean
 }
@@ -105,6 +107,15 @@ export interface ExecHandle {
   readonly timedOut: boolean
 }
 
+/** A long-running command started without waiting for it. */
+export interface SpawnedProcess {
+  readonly pid?: number
+  /** Resolves when the process ends, however it ends. Never rejects. */
+  readonly exited: Promise<{ exitCode: number | null; signal: string | null }>
+  /** Stop the process and everything it started. */
+  kill(signal?: NodeJS.Signals): void
+}
+
 export interface Sandbox {
   readonly info: SandboxInfo
   readonly policy: SandboxPolicy
@@ -113,6 +124,14 @@ export interface Sandbox {
     spec: ExecSpec,
     onOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void,
   ): Promise<ExecHandle>
+  /**
+   * Start a command and return immediately. It runs under the same policy and
+   * with the same scrubbed environment as `exec`.
+   */
+  spawn(
+    spec: ExecSpec,
+    onOutput: (chunk: string, stream: 'stdout' | 'stderr') => void,
+  ): SpawnedProcess
   /** Check a path against the policy without running anything. */
   canRead(path: string): boolean
   canWrite(path: string): boolean

@@ -338,7 +338,7 @@ const DECLARED_SIGNAL_LEVELS: Partial<Record<RiskSignal, { level: RiskLevel; rea
 
 export function isInside(child: string, parent: string): boolean {
   const rel = relative(resolve(parent), resolve(child))
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 export class RiskClassifier {

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { NetworkTarget } from '../../permissions/types.js'
+import type { SpawnedProcess } from '../../sandbox/types.js'
 import { isInside, resolvePath } from '../filesystem/paths.js'
 import type { Tool, ToolResult } from '../types.js'
 import { errorResult, fail, ok } from '../types.js'
@@ -95,7 +96,7 @@ export const runCommandTool: Tool<typeof inputSchema> = {
           args: ['-lc', input.command],
           cwd,
           timeoutMs: timeout,
-          stdin: ctx.signal ? undefined : undefined,
+          signal: ctx.signal,
         },
         (chunk, stream) => ctx.emit({ type: 'output', stream, chunk }),
       )
@@ -107,40 +108,49 @@ export const runCommandTool: Tool<typeof inputSchema> = {
   },
 }
 
+const MAX_BACKGROUND = 8
+
 function runBackground(
   input: z.output<typeof inputSchema>,
   ctx: Parameters<Tool['execute']>[1],
   cwd: string,
 ): ToolResult {
-  const { spawn } = require('node:child_process') as typeof import('node:child_process')
-  const id = `bg-${Math.abs(hashString(input.command)) % 100000}`
-  const child = spawn('bash', ['-lc', input.command], {
-    cwd,
-    env: { ...process.env },
-    detached: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const running = [...backgroundProcesses.values()].filter((p) => p.exitCode === undefined).length
+  if (running >= MAX_BACKGROUND) {
+    return fail(
+      `${running} background processes are already running (limit ${MAX_BACKGROUND}). Stop one with kill_process first.`,
+      'background (limit)',
+    )
+  }
+  const id = `bg-${++backgroundSeq}`
   const state: BackgroundProcess = {
     id,
     command: input.command,
-    child,
     startedAt: Date.now(),
     output: [],
+    size: 0,
     truncated: false,
-    exitCode: null,
+    exitCode: undefined,
+    proc: undefined,
   }
-  child.stdout?.on('data', (d: Buffer) => appendOutput(state, d, 'stdout', ctx))
-  child.stderr?.on('data', (d: Buffer) => appendOutput(state, d, 'stderr', ctx))
-  child.on('exit', (code) => {
-    state.exitCode = code
+  // Goes through the sandbox like every other command: same isolation, same
+  // scrubbed environment. Output is buffered for check_output, not streamed to
+  // the UI, because the tool call that started it has already returned.
+  state.proc = ctx.sandbox.spawn(
+    { command: 'bash', args: ['-lc', input.command], cwd },
+    (text, stream) => appendOutput(state, text, stream),
+  )
+  void state.proc.exited.then((result) => {
+    state.exitCode = result.exitCode ?? (result.signal ? -1 : null)
+    state.signal = result.signal ?? undefined
   })
   backgroundProcesses.set(id, state)
 
   return ok(
-    `Started background process ${id}: ${input.command}\nPID ${child.pid ?? '?'}\n` +
+    `Started background process ${id}: ${input.command}\nPID ${state.proc.pid ?? '?'}\n` +
       `Poll with check_output({ process_id: "${id}" }) and stop with kill_process({ process_id: "${id}" }).`,
     `background ${id}`,
-    { processId: id, pid: child.pid },
+    { processId: id, pid: state.proc.pid },
   )
 }
 
@@ -151,32 +161,40 @@ function runBackground(
 interface BackgroundProcess {
   id: string
   command: string
-  child: import('node:child_process').ChildProcess
   startedAt: number
   output: string[]
+  size: number
   truncated: boolean
-  exitCode: number | null
+  /** undefined while running; a number (or null if unknown) once finished. */
+  exitCode: number | null | undefined
+  signal?: string
+  proc: SpawnedProcess | undefined
 }
 
 const backgroundProcesses = new Map<string, BackgroundProcess>()
+let backgroundSeq = 0
 
 const BG_OUTPUT_CAP = 200_000
 
-function appendOutput(
-  state: BackgroundProcess,
-  chunk: Buffer,
-  stream: 'stdout' | 'stderr',
-  ctx: Parameters<Tool['execute']>[1],
-): void {
-  const text = chunk.toString('utf8')
-  const used = state.output.reduce((n, s) => n + s.length, 0)
-  if (used >= BG_OUTPUT_CAP) {
+function appendOutput(state: BackgroundProcess, text: string, stream: 'stdout' | 'stderr'): void {
+  if (state.size >= BG_OUTPUT_CAP) {
     state.truncated = true
     return
   }
-  state.output.push(stream === 'stdout' ? text : `[stderr] ${text}`)
-  ctx.emit({ type: 'output', stream, chunk: text })
+  const chunk = stream === 'stdout' ? text : `[stderr] ${text}`
+  state.output.push(chunk)
+  state.size += chunk.length
 }
+
+/** Stop every background process. Called when the session ends. */
+export function killAllBackground(): void {
+  for (const state of backgroundProcesses.values()) {
+    if (state.exitCode === undefined) state.proc?.kill('SIGKILL')
+  }
+}
+
+// Whatever ends the CLI, do not leave dev servers behind.
+process.once('exit', killAllBackground)
 
 const checkOutputSchema = z.object({
   process_id: z.string().describe('The process_id returned when the command was started.'),
@@ -199,11 +217,11 @@ export const checkOutputTool: Tool<typeof checkOutputSchema> = {
     if (!state) {
       return fail(`No background process with id ${input.process_id}.`, 'check_output')
     }
-    const running = state.exitCode === null
+    const running = state.exitCode === undefined
     const elapsed = Math.round((Date.now() - state.startedAt) / 1000)
     const status = running
       ? `still running (${elapsed}s elapsed)`
-      : `finished with exit code ${state.exitCode} (${elapsed}s)`
+      : `finished with exit code ${state.exitCode ?? 'unknown'}${state.signal ? ` (${state.signal})` : ''} (${elapsed}s)`
     const output = state.output.join('').slice(-8000) || '(no output yet)'
     return ok(
       `Process ${state.id}: ${status}\nCommand: ${state.command}\n\n${output}${state.truncated ? '\n[output truncated]' : ''}`,
@@ -231,17 +249,17 @@ export const killProcessTool: Tool<typeof killSchema> = {
   async execute(input) {
     const state = backgroundProcesses.get(input.process_id)
     if (!state) return fail(`No background process with id ${input.process_id}.`, 'kill')
-    if (state.exitCode !== null) {
+    if (state.exitCode !== undefined) {
       return ok(
         `Process ${state.id} already exited with code ${state.exitCode}.`,
         `kill ${state.id}`,
       )
     }
-    state.child.kill('SIGTERM')
+    state.proc?.kill('SIGTERM')
     setTimeout(() => {
-      if (state.exitCode === null) state.child.kill('SIGKILL')
+      if (state.exitCode === undefined) state.proc?.kill('SIGKILL')
     }, 3000).unref?.()
-    return ok(`Sent SIGTERM to ${state.id}.`, `kill ${state.id}`)
+    return ok(`Sent SIGTERM to ${state.id} and its child processes.`, `kill ${state.id}`)
   },
 }
 
@@ -297,10 +315,4 @@ export function extractNetworkTargets(command: string): NetworkTarget[] {
     if (m[1] && !/^\d+$/.test(m[1])) hosts.add(m[1])
   }
   return [...hosts].slice(0, 20).map((host) => ({ host, protocol: 'other' as const }))
-}
-
-function hashString(s: string): number {
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
-  return h
 }
