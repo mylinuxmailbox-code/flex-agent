@@ -2,7 +2,7 @@ import { Box, Text, useWindowSize } from 'ink'
 import type { AgentState } from '../../agent/events.js'
 import type { StatusInfo } from '../store.js'
 import { stateStyle, theme } from '../theme.js'
-import { PixelBuddy } from './PixelBuddy.jsx'
+import { PixelBuddy } from './PixelBuddy.js'
 
 /**
  * The top chrome: identity, live model state, and where you are.

@@ -127,7 +127,7 @@ const main = defineCommand({
     } else if (!session.sandbox.info.isolated) {
       process.stdout.write(
         `⚠ No sandbox available here: ${session.sandbox.info.detail}\n` +
-          '  Permission prompts still apply. Use --full-control to disable them.\n\n',
+          '  Use --full-control to disable prompts entirely.\n\n',
       )
     }
 
