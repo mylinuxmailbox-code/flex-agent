@@ -46,6 +46,12 @@ export function createModelProviders(options: ProviderRegistryOptions = {}): Mod
         Boolean(options.openai?.baseURL) ||
         Boolean(process.env.FLEX_OPENAI_API_KEY) ||
         Boolean(process.env.OPENAI_API_KEY) ||
+        Boolean(process.env.DEEPSEEK_API_KEY) ||
+        Boolean(process.env.MISTRAL_API_KEY) ||
+        Boolean(process.env.GROQ_API_KEY) ||
+        Boolean(process.env.TOGETHER_API_KEY) ||
+        Boolean(process.env.FIREWORKS_API_KEY) ||
+        Boolean(process.env.OPENROUTER_API_KEY) ||
         Boolean(process.env.FLEX_OPENAI_BASE_URL) ||
         Boolean(process.env.OPENAI_BASE_URL) ||
         isOpenAIModel(model)))
@@ -118,6 +124,16 @@ export function normalizeProviderId(value: string | undefined): ProviderId | und
     case 'openai':
     case 'openai-compatible':
     case 'openai_compatible':
+    case 'deepseek':
+    case 'mistral':
+    case 'llama':
+    case 'groq':
+    case 'together':
+    case 'fireworks':
+    case 'openrouter':
+    case 'ollama':
+    case 'vllm':
+    case 'lm-studio':
       return 'openai-compatible'
     case 'google':
     case 'gemini':

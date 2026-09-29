@@ -1,8 +1,8 @@
 import { Box, Text, useInput } from 'ink'
 import type { TranscriptItem } from '../store.js'
 import { theme } from '../theme.js'
-import { formatElapsed } from './Chrome.jsx'
-import { Markdown } from './Markdown.jsx'
+import { formatElapsed } from './Chrome.js'
+import { Markdown } from './Markdown.js'
 
 /**
  * The conversation.

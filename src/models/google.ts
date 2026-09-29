@@ -160,6 +160,12 @@ export class GoogleAIStudioProvider implements ModelProvider {
       timeoutMs: options.timeoutMs ?? 300_000,
     }
     this.#models = [...GOOGLE_AI_STUDIO_MODELS]
+    if (
+      this.#options.defaultModel &&
+      !this.#models.some((model) => model.id === this.#options.defaultModel)
+    ) {
+      this.#models.push(this.#modelForId(this.#options.defaultModel))
+    }
   }
 
   async available(): Promise<{ ok: boolean; reason?: string }> {

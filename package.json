@@ -7,6 +7,11 @@
   "engines": {
     "node": ">=22"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mylinuxmailbox-code/flex-agent.git"
+  },
+  "homepage": "https://github.com/mylinuxmailbox-code/flex-agent#readme",
   "bin": {
     "flex": "./dist/cli/main.js"
   },
@@ -16,6 +21,8 @@
   "scripts": {
     "dev": "tsx src/cli/main.ts",
     "build": "tsc -p tsconfig.build.json",
+    "postbuild": "node scripts/ensure-cli-executable.mjs",
+    "prepack": "npm run build",
     "start": "node dist/cli/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

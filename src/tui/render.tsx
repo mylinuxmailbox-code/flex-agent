@@ -1,7 +1,7 @@
 import { type Instance, render } from 'ink'
 import { createElement } from 'react'
 import type { Session } from '../session/session.js'
-import { App } from './App.jsx'
+import { App } from './App.js'
 import { UIStore } from './store.js'
 
 /**

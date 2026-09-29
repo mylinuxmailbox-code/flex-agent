@@ -63,6 +63,8 @@ export const DEFAULT_DENY_PATHS: readonly string[] = [
   '~/.claude.json',
   '~/.claude/.credentials.json',
   '~/.config/flex/credentials.json',
+  '~/.flex/config/credentials.json',
+  '~/.flex/config/config.json',
 ]
 
 export type SandboxStatus =

@@ -88,6 +88,7 @@ describe('OpenAICompatibleProvider', () => {
       defaultModel: 'qwen-local',
     })
     expect(provider.resolveModel('')?.id).toBe('qwen-local')
+    expect(provider.listModels().some((model) => model.id === 'qwen-local')).toBe(true)
     expect(provider.resolveModel('custom-local-model')?.id).toBe('custom-local-model')
   })
 })

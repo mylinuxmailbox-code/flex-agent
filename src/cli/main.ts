@@ -7,6 +7,7 @@ import { sessionPersistence } from '../session/persistence.js'
 import { Session } from '../session/session.js'
 import { mountUI } from '../tui/render.js'
 import { UIStore } from '../tui/store.js'
+import { ensureProviderSetup, showConfig } from './setup.js'
 
 /**
  * The CLI.
@@ -65,6 +66,11 @@ const main = defineCommand({
       description: 'Resume the most recent session in this workspace.',
       default: false,
     },
+    'show-config': {
+      type: 'boolean',
+      description: 'Show active provider/model/config provenance with secrets redacted.',
+      default: false,
+    },
   },
   async run({ args }) {
     const workspaceRoot = resolve(args.cwd ?? process.cwd())
@@ -77,6 +83,23 @@ const main = defineCommand({
       process.exit(2)
     }
 
+    if (args['show-config']) {
+      showConfig(workspaceRoot, {
+        provider: args.provider,
+        model: args.model,
+      })
+      return
+    }
+
+    const setup = await ensureProviderSetup(workspaceRoot, {
+      provider: args.provider,
+      model: args.model,
+    })
+    if (!setup.proceed) return
+    const selectedProvider =
+      setup.result?.providerId ?? setup.provider ?? args.provider ?? process.env.FLEX_PROVIDER
+    const selectedModel = setup.result?.model ?? args.model ?? process.env.FLEX_MODEL ?? ''
+
     let session: Session
     let resumedMessages: readonly AgentMessage[] = []
     let resumedPlan: readonly PlanStep[] = []
@@ -85,12 +108,12 @@ const main = defineCommand({
       const latest = await sessionPersistence.findLatest(workspaceRoot)
       if (latest) {
         session = await Session.resume(latest, {
-          model: args.model,
+          model: args.model ?? setup.result?.model ?? process.env.FLEX_MODEL,
           effort,
           permissionMode: args['full-control'] ? 'full-control' : undefined,
           fullControl: args['full-control'],
           noSandbox: args['no-sandbox'],
-          providerId: args.provider ?? process.env.FLEX_PROVIDER,
+          providerId: selectedProvider,
           debug: args.debug,
           workspaceRoot,
         })
@@ -102,24 +125,24 @@ const main = defineCommand({
       } else {
         process.stdout.write(`No saved session found for ${workspaceRoot}. Starting fresh.\n\n`)
         session = await Session.create({
-          model: args.model ?? process.env.FLEX_MODEL ?? '',
+          model: selectedModel,
           effort,
           permissionMode: args['full-control'] ? 'full-control' : 'ask',
           fullControl: args['full-control'],
           noSandbox: args['no-sandbox'],
-          providerId: args.provider ?? process.env.FLEX_PROVIDER,
+          providerId: selectedProvider,
           debug: args.debug,
           workspaceRoot,
         })
       }
     } else {
       session = await Session.create({
-        model: args.model ?? process.env.FLEX_MODEL ?? '',
+        model: selectedModel,
         effort,
         permissionMode: args['full-control'] ? 'full-control' : 'ask',
         fullControl: args['full-control'],
         noSandbox: args['no-sandbox'],
-        providerId: args.provider ?? process.env.FLEX_PROVIDER,
+        providerId: selectedProvider,
         debug: args.debug,
         workspaceRoot,
       })

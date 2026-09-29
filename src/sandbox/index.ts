@@ -109,16 +109,27 @@ export function flexDirs(): {
 
 export function buildPolicy(request: SandboxRequest): SandboxPolicy {
   const { cacheDir } = flexDirs()
+  const workspaceRoot = resolve(request.workspaceRoot)
+  // Project config and dotenv files can contain credentials. They remain
+  // available to Flex itself, but model-directed tools should not disclose them.
+  const workspaceSecrets = [
+    join(workspaceRoot, '.flex', 'config.json'),
+    join(workspaceRoot, '.env'),
+    join(workspaceRoot, '.env.local'),
+    join(workspaceRoot, '.env.development'),
+    join(workspaceRoot, '.env.production'),
+  ]
+  const denyPaths = [...DEFAULT_DENY_PATHS, ...workspaceSecrets, ...(request.denyPaths ?? [])]
   return {
-    readRoots: [resolve(request.workspaceRoot), homedir(), '/usr', '/etc', '/opt', '/bin', '/lib'],
+    readRoots: [workspaceRoot, homedir(), '/usr', '/etc', '/opt', '/bin', '/lib'],
     writeRoots: [
-      resolve(request.workspaceRoot),
+      workspaceRoot,
       tmpdir(),
       cacheDir,
       ...(request.additionalWriteRoots ?? []).map((r) => resolve(r)),
     ],
-    denyPaths: [...DEFAULT_DENY_PATHS, ...(request.denyPaths ?? [])],
-    denyWritePaths: [...DEFAULT_DENY_PATHS, ...(request.denyPaths ?? [])],
+    denyPaths,
+    denyWritePaths: denyPaths,
     network: request.network ?? { mode: 'disabled' },
     limits: { ...DEFAULT_LIMITS, ...request.limits },
   }

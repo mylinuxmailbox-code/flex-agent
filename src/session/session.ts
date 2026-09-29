@@ -5,6 +5,7 @@ import { execa } from 'execa'
 import type { AgentEvent } from '../agent/events.js'
 import { SubagentRunner } from '../agent/orchestrator/runner.js'
 import { AgentRuntime } from '../agent/runtime/loop.js'
+import { loadCredentials } from '../config/credentials.js'
 import { loadConfig, type ResolvedConfig } from '../config/index.js'
 import { readProjectInstructions, summariseRepository } from '../context/repo.js'
 import { mcpManager } from '../mcp/registry.js'
@@ -502,7 +503,13 @@ function selectInitialModel(
         configuredProviders?.openai?.baseURL ||
         process.env.FLEX_OPENAI_BASE_URL ||
         process.env.FLEX_OPENAI_API_KEY ||
-        process.env.OPENAI_API_KEY
+        process.env.OPENAI_API_KEY ||
+        process.env.DEEPSEEK_API_KEY ||
+        process.env.MISTRAL_API_KEY ||
+        process.env.GROQ_API_KEY ||
+        process.env.TOGETHER_API_KEY ||
+        process.env.FIREWORKS_API_KEY ||
+        process.env.OPENROUTER_API_KEY
       const hasAnthropic =
         configuredProviders?.anthropic?.apiKey ||
         configuredProviders?.anthropic?.authToken ||
@@ -526,9 +533,11 @@ function buildProviders(
   providerId?: string,
 ): ModelProvider[] {
   const configured = resolved.value.providers
+  const stored = loadCredentials()
   const preferred = normalizeProviderId(providerId)
   const genericKey = config.apiKey
   const genericBaseURL = config.baseURL
+  const env = process.env
 
   return createModelProviders({
     providerId,
@@ -536,16 +545,61 @@ function buildProviders(
     anthropic: {
       ...configured?.anthropic,
       ...(preferred === 'anthropic' || !preferred
-        ? { apiKey: genericKey, baseURL: genericBaseURL }
+        ? {
+            apiKey: genericKey ?? configured?.anthropic?.apiKey,
+            baseURL: genericBaseURL ?? configured?.anthropic?.baseURL,
+          }
         : {}),
+      apiKey:
+        env.ANTHROPIC_API_KEY ??
+        stored.anthropic?.apiKey ??
+        genericKey ??
+        configured?.anthropic?.apiKey,
+      baseURL:
+        env.ANTHROPIC_BASE_URL ??
+        (preferred === 'anthropic' || !preferred ? genericBaseURL : undefined) ??
+        configured?.anthropic?.baseURL,
+      authToken:
+        env.ANTHROPIC_AUTH_TOKEN ?? stored.anthropic?.authToken ?? configured?.anthropic?.authToken,
     },
     openai: {
       ...configured?.openai,
-      ...(preferred === 'openai-compatible' ? { apiKey: genericKey, baseURL: genericBaseURL } : {}),
+      label: configured?.openai?.label,
+      apiKey:
+        env.FLEX_OPENAI_API_KEY ??
+        env.OPENAI_API_KEY ??
+        env.DEEPSEEK_API_KEY ??
+        env.MISTRAL_API_KEY ??
+        env.GROQ_API_KEY ??
+        env.TOGETHER_API_KEY ??
+        env.FIREWORKS_API_KEY ??
+        env.OPENROUTER_API_KEY ??
+        (preferred === 'openai-compatible' ? genericKey : undefined) ??
+        stored.openai?.apiKey ??
+        configured?.openai?.apiKey,
+      baseURL:
+        env.FLEX_OPENAI_BASE_URL ??
+        env.OPENAI_BASE_URL ??
+        (preferred === 'openai-compatible' ? genericBaseURL : undefined) ??
+        configured?.openai?.baseURL,
     },
     google: {
       ...configured?.google,
-      ...(preferred === 'google' ? { apiKey: genericKey, baseURL: genericBaseURL } : {}),
+      apiKey:
+        env.FLEX_GOOGLE_API_KEY ??
+        env.FLEX_GEMINI_API_KEY ??
+        env.GEMINI_API_KEY ??
+        env.GOOGLE_API_KEY ??
+        env.GOOGLE_AI_API_KEY ??
+        (preferred === 'google' ? genericKey : undefined) ??
+        stored.google?.apiKey ??
+        configured?.google?.apiKey,
+      baseURL:
+        env.FLEX_GOOGLE_BASE_URL ??
+        env.GOOGLE_AI_BASE_URL ??
+        env.GEMINI_BASE_URL ??
+        (preferred === 'google' ? genericBaseURL : undefined) ??
+        configured?.google?.baseURL,
     },
   })
 }

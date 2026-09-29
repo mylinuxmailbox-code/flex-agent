@@ -51,7 +51,14 @@ export function resolvePath(
     }
   }
 
-  const denied = DEFAULT_DENY_PATHS.map((p) => expandPath(p))
+  const denied = [
+    ...DEFAULT_DENY_PATHS.map((p) => expandPath(p)),
+    resolve(ctx.workspaceRoot, '.flex', 'config.json'),
+    resolve(ctx.workspaceRoot, '.env'),
+    resolve(ctx.workspaceRoot, '.env.local'),
+    resolve(ctx.workspaceRoot, '.env.development'),
+    resolve(ctx.workspaceRoot, '.env.production'),
+  ]
   if (denied.some((d) => isInside(abs, d))) {
     throw new PathError(`path is in a protected location: ${rawPath}`, rawPath)
   }

@@ -1,222 +1,216 @@
 # Flex
 
-An autonomous coding agent for your terminal. `flex` launches a TUI; you tell
-Pixel what you want; it reads, edits, and verifies your actual repository.
+Flex is an autonomous coding agent for the terminal. It runs an Ink TUI, reads and edits the repository you point it at, executes tools through the permission engine, and shows streamed model output as it works.
+
+> Flex is installable from a clone and is not published by this project to npm. Do not run `npm publish` for this repository.
+
+## Install
+
+Requirements:
+
+- Git
+- Node.js 22 or newer
+- A terminal with a TTY for the first-run setup wizard
+
+From a fresh clone, run the installer:
 
 ```bash
-flex                              # interactive UI
-flex --model claude-opus-5-5     # pick a model
-flex --effort ultracode           # main xHigh + High subagents
-flex --full-control               # no prompts, no sandbox (you asked for it)
+git clone https://github.com/mylinuxmailbox-code/flex-agent.git
+cd flex-agent
+./install.sh
 ```
 
-Everything else is a slash command inside the session: `/help`, `/model`,
-`/effort`, `/auto`, `/permissions`, `/sandbox`, `/diff`, `/review`, `/test`,
-`/compact`, `/clear`, `/exit`.
+`install.sh` checks Git and Node, installs dependencies from the frozen pnpm lockfile using pnpm/Corepack, builds the ESM CLI, and installs a user-owned `flex` command without `sudo`. It prefers a pnpm global link and falls back to `~/.local/bin/flex`. The final smoke test runs `flex --help` from outside the repository.
 
-## Model providers
-
-Providers are selected from the model family or explicitly with `--provider`.
-Inside a session, `/model google:gemini-2.5-flash` and `/model gpt-4o` switch
-provider and model together without restarting the agent loop.
+If `~/.local/bin` is not already on `PATH`, add it to your shell startup file:
 
 ```bash
-# Anthropic (default when no other provider is configured)
-export ANTHROPIC_API_KEY=...
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For development instead of a user install:
+
+```bash
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
+corepack pnpm dev
+```
+
+The package can also be packed and installed locally for a packaging smoke test:
+
+```bash
+npm pack
+npm install --global ./flex-0.1.0.tgz
+```
+
+## First launch and provider setup
+
+Run Flex from the repository you want to work on:
+
+```bash
+cd /path/to/project
+flex
+```
+
+When no provider is configured, Flex opens a first-run Ink wizard. It supports:
+
+- Google AI Studio / Gemini
+- OpenAI
+- Anthropic / Claude
+- DeepSeek
+- Mistral
+- Hosted Llama, with an explicit endpoint for Groq, Together, Fireworks, or another host
+- Any other OpenAI-compatible endpoint, including Ollama, vLLM, LM Studio, OpenRouter, and company-hosted APIs
+
+The hosted Llama and custom paths deliberately ask for a base URL. Hosted Llama services are not treated as one interchangeable API: select the service's actual OpenAI-compatible endpoint and model ID.
+
+The wizard remembers the provider, model, label, and base URL in the user-level config. API keys are stored separately in `~/.flex/config/credentials.json` with mode `0600`; they are never written by the wizard into a project config. Press Esc to cancel without saving. Environment variables remain supported and take precedence over stored values.
+
+### Environment variables
+
+For non-interactive or scripted use, configure a provider before launching:
+
+```bash
+# Anthropic
+export ANTHROPIC_API_KEY='...'
 flex --model claude-opus-5-5
 
-# OpenAI or any OpenAI-compatible endpoint
-export OPENAI_API_KEY=...
-# Optional for Ollama, vLLM, LM Studio, OpenRouter, or another compatible server:
-export OPENAI_BASE_URL=http://localhost:11434/v1
-flex --provider openai --model qwen2.5-coder
+# OpenAI
+export OPENAI_API_KEY='...'
+flex --provider openai --model gpt-4o
 
-# Google AI Studio / Gemini
-export GEMINI_API_KEY=...
+# Google AI Studio
+export GEMINI_API_KEY='...'
 flex --provider google --model gemini-2.5-flash
+
+# Local OpenAI-compatible server; a key is usually unnecessary
+export OPENAI_BASE_URL='http://localhost:11434/v1'
+flex --provider openai --model qwen2.5-coder
 ```
 
-`FLEX_OPENAI_API_KEY`, `FLEX_OPENAI_BASE_URL`, `FLEX_OPENAI_MODEL`, and
-`FLEX_GOOGLE_API_KEY`-style project-specific variables may be used alongside
-the standard provider variables. Provider connections can also be configured
-in `.flex/config.json` or `~/.flex/config.json` under `providers.anthropic`,
-`providers.openai`, and `providers.google`. API keys passed through environment
-variables are preferred so they are not written to disk.
+Flex also accepts `FLEX_OPENAI_API_KEY`, `FLEX_OPENAI_BASE_URL`, `FLEX_OPENAI_MODEL`, `FLEX_GOOGLE_API_KEY`, `FLEX_GOOGLE_BASE_URL`, `FLEX_GEMINI_API_KEY`, and provider-specific compatible aliases such as `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, and `GROQ_API_KEY`.
 
----
+Configuration precedence is:
 
-## What is built and verified
+1. Explicit CLI flags such as `--provider` and `--model`
+2. Environment variables (`FLEX_*` and provider variables)
+3. Project config at `.flex/config.json`
+4. User config at `~/.flex/config/config.json`
+5. Built-in defaults
 
-This is a working vertical slice, not a mock. Each claim below is backed by a
-test in `tests/` or by a command you can run.
+For credentials, environment variables override user-local credentials, which override non-secret configured values. Flex never prints secret values in diagnostics or intentionally forwards them to model-run shell commands.
 
-| Area | State |
-|---|---|
-| Ink 7 TUI — header, transcript, input, status bar, Pixel Buddy | working |
-| Multiline editor, slash + `@file` completion, history | working |
-| Agent loop — stream, tool calls, parallel execution, stop-reason handling | working, 12 tests |
-| Anthropic provider — streaming, tool use, effort, prompt caching | working |
-| OpenAI-compatible provider — OpenAI/DeepSeek/Ollama/vLLM/LM Studio/OpenRouter | working, streaming/tool calls/usage covered by tests |
-| Google AI Studio provider — Gemini REST/SSE, thinking, streaming/tool calls/usage | working, covered by tests |
-| 21 built-in tools: read, write, edit, move, delete, list, glob, grep, regex, shell, background processes, git, memory, plan, web search/fetch | working |
-| **Sandbox** — bubblewrap, real namespaces, verified by 11 isolation tests | working on this machine |
-| **Risk classifier + permission engine** — 30+ command rules, path rules, network rules | working |
-| Auto mode, full-control mode, informed permission dialog | working |
-| Repository discovery, project instructions, project memory | working |
-| **Subagent orchestration** — 11 roles, real parallel fan-out, Ultracode/Maxcode | working |
-| **Plugins + Claude Code plugin import** | working |
-| **MCP** — stdio servers adapted into the permission-gated tool path | working |
-| **Web search / fetch** with SSRF guard | working |
-| **Skills** — per-request activation, only matching ones enter context | working |
-| **Config** — 5-layer hierarchy with per-key provenance | working |
-| **Session persistence / resume** | working |
-| Markdown + syntax highlighting rendered by Ink | working |
+### Non-secret configuration
 
-Run the checks:
+The wizard writes non-secret settings to `~/.flex/config/config.json`. A project may override them in `.flex/config.json`; keep API keys out of both files.
+
+Example:
+
+```json
+{
+  "provider": "openai-compatible",
+  "model": "llama-3.3-70b-versatile",
+  "providers": {
+    "openai": {
+      "label": "Groq",
+      "baseURL": "https://api.groq.com/openai/v1"
+    }
+  }
+}
+```
+
+Use `--show-config` to inspect the active provider, model, provenance, endpoints, and only configured/missing credential status:
 
 ```bash
-pnpm typecheck    # 0 errors
-pnpm test         # 38 passing across 6 files
-pnpm lint         # 0 errors
+flex --show-config
+flex --cwd /path/to/project --show-config
 ```
 
-### The live end-to-end test
+The output is JSON with secrets redacted. It is safe to attach when diagnosing configuration, but still review endpoint names and paths before sharing it.
 
-`tests/live-smoke.ts` builds a throwaway repo with a real failing test, runs the
-real agent loop against the real model through the real sandbox, and checks
-that the agent found the bug, fixed it, and that the suite then passes.
-
-It needs a credential, so it is not part of `pnpm test`:
+## Usage
 
 ```bash
-cd ~/flex && pnpm exec tsx tests/live-smoke.ts
+flex                              # launch the TUI
+flex --model claude-opus-5-5     # choose a model
+flex --provider google            # choose a provider
+flex --effort ultracode           # enable the subagent profile
+flex --full-control               # disable prompts and sandbox; use deliberately
+flex --no-sandbox                 # disable isolation but keep permission prompts
+flex --continue                   # resume the latest saved session
+flex --help
+flex --version
 ```
 
----
+Inside a session, slash commands include:
 
-## What is NOT built yet
+- `/help` — command help
+- `/model [provider:]model` — inspect or switch provider/model, including custom IDs
+- `/effort [level]` — change effort (`low`, `medium`, `high`, `xhigh`, `pro`, `max`, `ultracode`, `maxcode`)
+- `/auto` and `/permissions` — inspect or change permission behavior
+- `/sandbox` — inspect or change sandbox behavior
+- `/diff`, `/review`, `/test` — review and verify work
+- `/compact`, `/clear`, `/exit` — manage context and the session
 
-Stated plainly, because a checklist that hides gaps is worse than no checklist:
-
-- **Code intelligence beyond text search.** No TypeScript Compiler API symbol
-  resolution, no tree-sitter, no LSP. Grep and glob are what you get.
-- **macOS/Windows sandboxes.** Only Linux via bubblewrap; elsewhere Flex reports
-  `unsandboxed` in the status bar and says why rather than pretending.
-- **Truncation guard in subagents.** A subagent that reaches its 24-turn limit
-  returns a partial report rather than being retried.
-- **`/undo` and `/redo`** are advisory, not implemented.
-- **Destructive git mutations** are intentionally *not* structured tools. They go
-  through `run_command` so the risk engine sees the real command text.
-
----
+Model providers retain their native behavior at the adapter boundary: Anthropic tool streaming and caching, Gemini streaming/thinking/tool calls, and OpenAI-compatible streaming, tool calls, usage chunks, cancellation, custom model IDs, and normalized base URLs.
 
 ## Security model
 
-Every tool call — built-in, plugin, or MCP — passes
-`ToolAuthorizer.authorize` before it executes. There is no path from an agent
-decision to a side effect that skips it.
+The normal execution path is:
 
-```
-model → Tool.plan() → RiskClassifier → PermissionEngine → Sandbox → execute
+```text
+model → tool plan → risk classifier → permission engine → sandbox → execute
 ```
 
-**The sandbox is real.** On Linux, commands run under `bwrap` with user, mount,
-pid, ipc, uts and (when the network policy is `disabled`) network namespaces.
-The host filesystem is read-only except for the granted roots. Deny-listed
-paths are shadowed with an empty mount. Verified by tests that fail loudly if
-isolation silently degrades — including one that asserts a command cannot write
-outside the workspace and one that asserts `ANTHROPIC_API_KEY` is **not** visible
-to a command the model chose to run (that test caught a real bug: bubblewrap
-inherits the parent environment unless you pass `--clearenv`).
+Every built-in, plugin, and MCP tool is authorized before it can cause a side effect. On Linux, Flex uses bubblewrap when available with mount, user, PID, IPC, UTS, and optional network namespaces. The workspace and approved scratch roots are writable; the rest of the host filesystem is read-only. Protected credential locations, project dotenv files, and project Flex config are denied to model-directed filesystem tools.
 
-**Risk is declared, not guessed.** `delete_file` does not look risky to a
-classifier that only sees a path, so tools declare their own signals in
-`plan()`. A declared `destructive-delete` is on the never-auto list, which means
-`delete_file` prompts even with auto mode on and the threshold set to `critical`.
-(A test asserts exactly this; it also caught the bug where delete ran silently.)
+Commands run by the model receive a scrubbed environment and a scratch `HOME`; API keys from the Flex process are not passed through. Structured logs redact common token and credential formats. `--full-control` is an explicit escape hatch: it disables both permission prompts and isolation and prints a persistent warning in the UI. On systems without a usable sandbox, Flex reports the degraded state instead of pretending that isolation is active.
 
-**Secrets do not leak into commands.** The sandbox clears the environment and
-re-adds only non-secret variables, and `$HOME` is remapped to a scratch
-directory. Credentials cannot be read out of the environment by a test script
-the model wrote, and credential paths are deny-listed and shadowed.
+## Features
 
-**Full control is honest.** `flex --full-control` prints a warning before the UI
-starts, keeps a persistent `⚡ FULL CONTROL` indicator in the header and status
-bar, and disables both prompts and isolation. It does not silently do less than
-it says.
+- Ink 7 terminal UI with streamed transcript, markdown, syntax highlighting, status bar, completion, history, and Pixel Buddy
+- Anthropic, Google AI Studio, OpenAI, DeepSeek, Mistral, hosted Llama, and arbitrary OpenAI-compatible model adapters
+- Provider/model switching, provider-prefixed model IDs, model discovery hooks, structured errors, usage, replay, and cancellation
+- Filesystem, shell, git, memory, planning, web, background-process, MCP, plugin, skills, and subagent tools
+- Permission policies, risk classification, sandbox backends, output limits, secret scrubbing, and SSRF protection
+- Repository discovery, project instructions, context compaction, session persistence, resume, and configuration provenance
+- Ultracode and Maxcode subagent orchestration with the same permission path as the main agent
 
----
+## Checks
 
-## Architecture
-
-```
-src/
-  cli/           argument parsing, launch
-  tui/           Ink components, Pixel Buddy, store, slash commands
-  agent/
-    runtime/     the loop — streams, authorizes, executes, feeds back
-    orchestrator/  parallel subagent fan-out
-    subagents/     11 role definitions with scoped tool allowlists
-    system-prompt.ts
-    events.ts    everything the runtime tells the outside world
-  models/        provider abstraction + Anthropic + OpenAI-compatible + Google AI Studio adapters
-  tools/         filesystem, search, shell, git, web, memory, planning, subagents
-  mcp/           MCP client, tool adapter, server registry
-  plugins/       manifest, manager, Claude Code compatibility adapter
-  skills/        registry + built-in skills, per-request activation
-  config/        five-layer configuration with provenance
-  permissions/   classifier (rules) + policy engine (decisions)
-  sandbox/       abstraction + bubblewrap backend + honest fallback
-  session/       composition root
-  context/       repository discovery, project memory
-  observability/ structured logging with secret redaction
-```
-
-Two rules hold the shape together:
-
-1. **The runtime never touches the terminal.** It emits `AgentEvent`s. That is
-   why the same agent runs headless, under test, or behind a plugin UI.
-2. **A tool under-reports at its peril.** `plan()` runs *before* authorization
-   and is how a tool tells the security layer what it is about to touch. It must
-   be conservative.
-
----
-
-## Effort
-
-`low · medium · high · xhigh · pro · max · ultracode · maxcode`
-
-Effort changes real behaviour, not just a label: planning, exploration breadth,
-verification depth, and research bias all come from `effortProfile()`.
-
-One honest caveat: the Anthropic API accepts `low|medium|high|xhigh|max`, so
-Flex's `pro` rides on `xhigh` at the wire level and is differentiated by
-orchestration — broader research, a longer verification ladder, and a forced
-self-review pass.
-
-`ultracode` and `maxcode` are genuinely different: they expose a
-`spawn_subagent` tool and pin a subagent effort, so the model can fan work out
-and read structured reports back.
-
-| Mode | Main | Subagents | Parallel cap |
-|---|---|---|---|
-| Ultracode | xHigh | High | 4 |
-| Maxcode | Max | Pro | 6 |
-
-The tool is only advertised when the profile has subagents, so single-agent
-modes never see the option. Subagent tool calls go through the same permission
-engine — being spawned is not a privilege level.
-
----
-
-## Development
+Run the required local checks before sharing a change:
 
 ```bash
-pnpm install
-pnpm dev                      # run from source
-pnpm build && pnpm start      # compile and run
-pnpm check                    # typecheck + lint + test
+corepack pnpm typecheck
+corepack pnpm lint
+corepack pnpm test
+corepack pnpm build
+npm pack --dry-run
 ```
 
-Built with TypeScript 5.9 (strict, `noUncheckedIndexedAccess`), Ink 7, React 19,
-Node ≥ 22.
+The deterministic suite does not contact paid model APIs. The optional live smoke test needs a real credential and is intentionally not part of the normal test command:
+
+```bash
+corepack pnpm exec tsx tests/live-smoke.ts
+```
+
+Do not fabricate credential-dependent results and do not publish the package to npm.
+
+## Development layout
+
+```text
+src/
+  cli/           argument parsing, first-run setup, diagnostics
+  tui/           Ink components, setup wizard, store, slash commands
+  models/        provider abstraction and Anthropic/Google/OpenAI-compatible adapters
+  agent/         streaming runtime, orchestration, subagents, system prompt
+  tools/         filesystem, shell, git, web, memory, MCP, plugins, skills
+  config/        layered config and user-local credentials
+  permissions/   risk classifier and authorization policy
+  sandbox/       bubblewrap backend and honest fallback
+  session/       composition root and persistence integration
+  context/       repository discovery and project memory
+  observability/ structured logging with redaction
+```
+
+Flex is strict TypeScript, ESM-only, Node 22+, Ink 7, and React 19. The runtime does not write directly to the terminal; it emits events so the same loop remains testable and usable by other front ends.

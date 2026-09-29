@@ -30,6 +30,8 @@ import {
  */
 
 export interface OpenAICompatibleOptions {
+  /** Human label for a configured endpoint. */
+  label?: string
   /** The endpoint root. `/v1` is added when the URL has no path. */
   baseURL?: string
   apiKey?: string
@@ -83,7 +85,7 @@ function defaultModels(baseURL: string, contextWindow: number): ModelInfo[] {
 
 export class OpenAICompatibleProvider implements ModelProvider {
   readonly id = 'openai-compatible'
-  readonly label = 'OpenAI-compatible'
+  readonly label: string
   readonly #client: OpenAI
   readonly #options: Required<
     Pick<OpenAICompatibleOptions, 'baseURL' | 'timeoutMs' | 'includeUsage'>
@@ -92,6 +94,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   #models: ModelInfo[] | null = null
 
   constructor(options: OpenAICompatibleOptions = {}) {
+    this.label = options.label?.trim() || 'OpenAI-compatible'
     this.#options = {
       ...options,
       baseURL: normalizeBaseURL(
@@ -101,6 +104,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
         options.apiKey ??
         process.env.FLEX_OPENAI_API_KEY ??
         process.env.OPENAI_API_KEY ??
+        process.env.DEEPSEEK_API_KEY ??
+        process.env.MISTRAL_API_KEY ??
+        process.env.GROQ_API_KEY ??
+        process.env.TOGETHER_API_KEY ??
+        process.env.FIREWORKS_API_KEY ??
+        process.env.OPENROUTER_API_KEY ??
         'not-needed',
       defaultModel: options.defaultModel ?? process.env.FLEX_OPENAI_MODEL ?? 'gpt-4o',
       timeoutMs: options.timeoutMs ?? 300_000,
@@ -116,7 +125,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   async available(): Promise<{ ok: boolean; reason?: string }> {
     try {
-      await this.#client.models.list()
+      const response = await this.#client.models.list()
+      const discovered = response.data
+        .filter((model) => Boolean(model.id))
+        .map((model) => this.modelInfo(model.id, model.id))
+      if (discovered.length > 0) this.#models = discovered
       return { ok: true }
     } catch (err) {
       return {
@@ -129,6 +142,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
   listModels(): ModelInfo[] {
     if (!this.#models) {
       this.#models = defaultModels(this.#options.baseURL, this.#options.contextWindow ?? 128_000)
+      const defaultModel = this.#options.defaultModel
+      if (defaultModel && !this.#models.some((model) => model.id === defaultModel)) {
+        this.#models.push(this.modelInfo(defaultModel, defaultModel))
+      }
     }
     return this.#models
   }
@@ -149,9 +166,13 @@ export class OpenAICompatibleProvider implements ModelProvider {
     // Servers accept arbitrary model ids and a local server's catalogue is not
     // knowable ahead of time, so an unknown id is assumed valid rather than
     // rejected — with conservative capability assumptions.
+    return this.modelInfo(normalized, normalized)
+  }
+
+  private modelInfo(id: string, label: string): ModelInfo {
     return {
-      id: normalized,
-      label: normalized,
+      id,
+      label,
       contextWindow: this.#options.contextWindow ?? 128_000,
       maxOutputTokens: this.#options.maxOutputTokens ?? 8_192,
       supportsTools: true,

@@ -33,6 +33,7 @@ export const modelProviderSchema = z.enum(['anthropic', 'openai', 'openai-compat
 
 const providerConnectionSchema = z
   .object({
+    label: z.string().min(1).max(80).optional(),
     apiKey: z.string().optional(),
     authToken: z.string().optional(),
     baseURL: z.string().url().optional(),
