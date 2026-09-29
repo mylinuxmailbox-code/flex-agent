@@ -30,9 +30,53 @@ export const effortSchema = z.enum([
 export const permissionModeSchema = z.enum(['ask', 'auto', 'full-control'])
 export const networkModeSchema = z.enum(['disabled', 'restricted', 'allowed'])
 
+export const providerTypeSchema = z.enum(['anthropic', 'openai-compatible', 'google'])
+
+const modelOverrideSchema = z.object({
+  id: z.string(),
+  label: z.string().optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
+  supportsTools: z.boolean().optional(),
+  supportsThinking: z.boolean().optional(),
+  supportsEffort: z.boolean().optional(),
+})
+
+/**
+ * One model provider.
+ *
+ * The key under `providers` is the provider's name and doubles as the
+ * `provider:model` prefix. `anthropic`, `google` and `openai` are recognised
+ * built-ins and need no `type`; any other name is an OpenAI-compatible endpoint
+ * unless `type` says otherwise.
+ */
+export const providerConfigSchema = z.object({
+  type: providerTypeSchema.optional(),
+  label: z.string().optional(),
+  enabled: z.boolean().optional(),
+  baseURL: z.string().optional(),
+  /** Literal key. Prefer `apiKeyEnv`; the config file is created mode 0600. */
+  apiKey: z.string().optional(),
+  /** Name of the environment variable holding the key. */
+  apiKeyEnv: z.string().optional(),
+  headers: z.record(z.string(), z.string()).optional(),
+  defaultModel: z.string().optional(),
+  models: z.array(z.union([z.string(), modelOverrideSchema])).optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  /** OpenAI-compatible only: which token-limit parameter the server understands. */
+  maxTokensParam: z.enum(['max_tokens', 'max_completion_tokens']).optional(),
+  /** OpenAI-compatible only: send `reasoning_effort`. Default: by model name. */
+  reasoningEffort: z.boolean().optional(),
+})
+
+export type ProviderConfig = z.infer<typeof providerConfigSchema>
+
 /** Every value is optional; a partial config is valid and normal. */
 export const flexConfigSchema = z.object({
   model: z.string().optional(),
+  providers: z.record(z.string(), providerConfigSchema).optional(),
   effort: effortSchema.optional(),
   permissions: z
     .object({
@@ -62,7 +106,9 @@ export const flexConfigSchema = z.object({
 
   web: z
     .object({
-      provider: z.enum(['anthropic', 'brave', 'exa', 'tavily', 'none']).optional(),
+      provider: z
+        .enum(['auto', 'anthropic', 'brave', 'exa', 'tavily', 'duckduckgo', 'none'])
+        .optional(),
       apiKey: z.string().optional(),
       maxResults: z.number().int().min(1).max(50).optional(),
       allowedDomains: z.array(z.string()).optional(),
@@ -113,7 +159,7 @@ const DEFAULTS: FlexConfig = {
   effort: 'high',
   permissions: { mode: 'ask', autoThreshold: 'low' },
   sandbox: { enabled: true, network: 'disabled' },
-  web: { provider: 'anthropic', maxResults: 10 },
+  web: { provider: 'auto', maxResults: 10 },
   mcp: { servers: {}, enabled: [], disabled: [] },
   plugins: { enabled: [], disabled: [], paths: [] },
   ui: { maxFps: 30, showThinking: false },
@@ -147,25 +193,61 @@ function readJson(path: string): FlexConfig | null {
   }
 }
 
-/** Shallow-merge per top-level key; nested objects merge one level deeper. */
-function merge(base: FlexConfig, overlay: FlexConfig): FlexConfig {
-  const out: FlexConfig = { ...base }
-  for (const [key, value] of Object.entries(overlay)) {
-    if (value === undefined) continue
-    const k = key as keyof FlexConfig
-    const existing = out[k]
-    if (
-      typeof value === 'object' &&
-      value !== null &&
-      !Array.isArray(value) &&
-      typeof existing === 'object' &&
-      existing !== null &&
-      !Array.isArray(existing)
-    ) {
-      out[k] = { ...existing, ...value } as never
-    } else {
-      out[k] = value as never
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+function mergeValue(base: unknown, overlay: unknown): unknown {
+  if (isPlainObject(base) && isPlainObject(overlay)) {
+    const out: Record<string, unknown> = { ...base }
+    for (const [key, value] of Object.entries(overlay)) {
+      if (value === undefined) continue
+      out[key] = mergeValue(base[key], value)
     }
+    return out
+  }
+  // Arrays and scalars are replaced, not concatenated: a project that lists
+  // `plugins.disabled` means exactly that list.
+  return overlay
+}
+
+/** Deep-merge plain objects; later layers win per key. */
+export function merge(base: FlexConfig, overlay: FlexConfig): FlexConfig {
+  return mergeValue(base, overlay) as FlexConfig
+}
+
+/**
+ * A repository controls its own `.flex/config.json`, and a repository you just
+ * cloned is not trusted. Anything that could redirect a credential or run a
+ * program is therefore ignored at the project layer and reported once:
+ * provider endpoints and keys, and MCP server definitions. Per-user config is
+ * where those belong.
+ */
+export function sanitizeProjectConfig(config: FlexConfig, source = 'project config'): FlexConfig {
+  const ignored: string[] = []
+  const out: FlexConfig = { ...config }
+
+  if (config.providers) {
+    const providers: NonNullable<FlexConfig['providers']> = {}
+    for (const [name, spec] of Object.entries(config.providers)) {
+      const { baseURL, apiKey, apiKeyEnv, headers, ...safe } = spec
+      if (baseURL || apiKey || apiKeyEnv || headers)
+        ignored.push(`providers.${name}.{baseURL,apiKey,apiKeyEnv,headers}`)
+      providers[name] = safe
+    }
+    out.providers = providers
+  }
+  if (config.mcp?.servers && Object.keys(config.mcp.servers).length > 0) {
+    ignored.push('mcp.servers')
+    out.mcp = { ...config.mcp, servers: undefined }
+  }
+  if (config.web?.apiKey) {
+    ignored.push('web.apiKey')
+    out.web = { ...config.web, apiKey: undefined }
+  }
+  if (ignored.length > 0) {
+    process.stderr.write(
+      `flex: ${source} may not set ${ignored.join(', ')} (a repository cannot redirect credentials or start programs). Put them in your user config.\n`,
+    )
   }
   return out
 }
@@ -176,25 +258,30 @@ export function loadConfig(options: {
   session?: FlexConfig
 }): ResolvedConfig {
   const provenance = {} as Record<keyof FlexConfig, ConfigLayer | undefined>
-  let value = { ...DEFAULTS }
+  let value: FlexConfig = structuredClone(DEFAULTS)
   for (const key of Object.keys(DEFAULTS) as (keyof FlexConfig)[]) provenance[key] = 'defaults'
 
   const global = readJson(globalConfigPath())
   if (global) {
     value = merge(value, global)
-    for (const key of Object.keys(global) as (keyof FlexConfig)[]) provenance[key] = 'global'
+    for (const key of Object.keys(global) as (keyof FlexConfig)[]) {
+      if (global[key] !== undefined) provenance[key] = 'global'
+    }
   }
 
-  const project = readJson(projectConfigPath(options.workspaceRoot))
+  const rawProject = readJson(projectConfigPath(options.workspaceRoot))
+  const project = rawProject ? sanitizeProjectConfig(rawProject) : null
   if (project) {
     value = merge(value, project)
-    for (const key of Object.keys(project) as (keyof FlexConfig)[]) provenance[key] = 'project'
+    for (const key of Object.keys(project) as (keyof FlexConfig)[]) {
+      if (project[key] !== undefined) provenance[key] = 'project'
+    }
   }
 
   if (options.session) {
     value = merge(value, options.session)
     for (const key of Object.keys(options.session) as (keyof FlexConfig)[]) {
-      provenance[key] = 'session'
+      if (options.session[key] !== undefined) provenance[key] = 'session'
     }
   }
 
@@ -218,4 +305,23 @@ export function saveProjectConfig(workspaceRoot: string, patch: FlexConfig): voi
 /** `FLEX_HOME` lets tests and sandboxes relocate all Flex state. */
 export function configHome(): string {
   return process.env.FLEX_HOME ?? join(homedir(), '.flex')
+}
+
+/** Human-readable dump of the effective config with the layer each key came from. */
+export function describeConfig(resolved: ResolvedConfig): string {
+  const redact = (key: string, value: unknown): unknown =>
+    /key|token|secret|authorization/i.test(key) && typeof value === 'string' && value
+      ? '***'
+      : value
+  const lines: string[] = []
+  for (const [key, value] of Object.entries(resolved.value)) {
+    const layer = resolved.provenance[key as keyof FlexConfig] ?? 'defaults'
+    lines.push(`${key}  [${layer}]`)
+    lines.push(
+      ...JSON.stringify(value, redact, 2)
+        .split('\n')
+        .map((l) => `  ${l}`),
+    )
+  }
+  return lines.join('\n')
 }

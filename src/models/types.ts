@@ -201,6 +201,11 @@ export interface ToolUseBlock {
   id: string
   name: string
   input: unknown
+  /**
+   * Opaque provider state that must be echoed back on the next request, e.g.
+   * Gemini's `thoughtSignature` for a function call. Other providers ignore it.
+   */
+  providerMeta?: Record<string, unknown>
 }
 
 /** A tool the model executed on our behalf (server-side: web_search, bash, ...). */
@@ -368,6 +373,14 @@ export interface ToolCallEndEvent {
   id: string
   name: string
   input: unknown
+  /** See `ToolUseBlock.providerMeta`. */
+  providerMeta?: Record<string, unknown>
+}
+
+/** The signature that authenticates a thinking block so it can be replayed. */
+export interface ThinkingSignatureEvent {
+  type: 'thinking_signature'
+  signature: string
 }
 
 export interface UsageEvent {
@@ -390,6 +403,7 @@ export type StreamEvent =
   | MessageStartEvent
   | TextDeltaEvent
   | ThinkingDeltaEvent
+  | ThinkingSignatureEvent
   | CitationDeltaEvent
   | ToolCallStartEvent
   | ToolCallDeltaEvent
@@ -502,6 +516,8 @@ export interface ModelInfo {
   pricing?: Pricing
   /** Set when the model id is a local alias rather than a provider id. */
   alias?: string
+  /** Id of the provider that serves this model (`anthropic`, `google`, ...). */
+  provider?: string
 }
 
 export interface ModelRequest {
@@ -533,6 +549,11 @@ export interface ModelTool {
   description: string
   /** JSON Schema for the tool input. */
   inputSchema: Record<string, unknown>
+  /**
+   * Ask the provider to enforce the schema strictly. Only sensible for schemas
+   * Flex generated itself; third-party (MCP) schemas set this to false.
+   */
+  strict?: boolean
 }
 
 export interface ServerToolSpec {

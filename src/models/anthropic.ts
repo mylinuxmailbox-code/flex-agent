@@ -126,8 +126,14 @@ export class AnthropicProvider implements ModelProvider {
   readonly label = 'Anthropic'
   readonly #client: Anthropic
   readonly #models: ModelInfo[]
+  readonly #credential: string | undefined
 
   constructor(options: AnthropicProviderOptions = {}) {
+    this.#credential =
+      options.apiKey ??
+      options.authToken ??
+      process.env.ANTHROPIC_API_KEY ??
+      process.env.ANTHROPIC_AUTH_TOKEN
     this.#client = new Anthropic({
       apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY,
       // A proxy baseURL must not carry `/v1`; the SDK concatenates `/v1/messages`.
@@ -136,12 +142,15 @@ export class AnthropicProvider implements ModelProvider {
       maxRetries: options.maxRetries ?? 2,
       timeout: options.timeoutMs ?? 600_000,
     })
-    this.#models = [...ANTHROPIC_MODELS]
+    this.#models = ANTHROPIC_MODELS.map((m) => ({ ...m, provider: 'anthropic' }))
+  }
+
+  configured(): boolean {
+    return Boolean(this.#credential)
   }
 
   async available(): Promise<{ ok: boolean; reason?: string }> {
-    if (process.env.ANTHROPIC_AUTH_TOKEN) return { ok: true }
-    if (process.env.ANTHROPIC_API_KEY) return { ok: true }
+    if (this.#credential) return { ok: true }
     return { ok: false, reason: 'ANTHROPIC_API_KEY is not set' }
   }
 
@@ -151,13 +160,27 @@ export class AnthropicProvider implements ModelProvider {
 
   resolveModel(spec: string): ModelInfo | undefined {
     const normalized = spec.trim().toLowerCase()
+    if (!normalized) return this.#models[0]
     const direct = this.#models.find((m) => m.id === normalized)
     if (direct) return direct
     const aliased = ALIASES[normalized]
     if (aliased) return this.#models.find((m) => m.id === aliased)
-    // `claude-` prefix tolerance.
+    // Any other `claude-*` id is still an Anthropic model (a dated snapshot, or
+    // one released after this table was written). Assume the family defaults
+    // rather than routing it to a provider that would answer 404.
     if (normalized.startsWith('claude-')) {
-      return this.#models.find((m) => m.id === `claude-${normalized.slice(7)}`)
+      return {
+        id: spec.trim(),
+        label: spec.trim(),
+        contextWindow: 200_000,
+        maxOutputTokens: 64_000,
+        supportsTools: true,
+        supportsThinking: false,
+        supportsEffort: false,
+        supportsWebSearch: false,
+        supportsPromptCaching: true,
+        provider: 'anthropic',
+      }
     }
     return undefined
   }
@@ -207,7 +230,7 @@ export class AnthropicProvider implements ModelProvider {
       name: tool.name,
       description: tool.description,
       input_schema: tool.inputSchema as Anthropic.Tool.InputSchema,
-      strict: true,
+      ...(tool.strict === false ? {} : { strict: true }),
       // Lets tool arguments stream in as they are produced instead of arriving
       // as one blob at the end, which makes long tool calls feel immediate.
       eager_input_streaming: true,
@@ -227,7 +250,9 @@ export class AnthropicProvider implements ModelProvider {
       model,
       max_tokens: maxTokens,
       system,
-      messages: request.messages.map(convertMessage),
+      messages: request.messages
+        .map(convertMessage)
+        .filter((m) => (m.content as unknown[]).length > 0),
       ...(tools.length > 0 ? { tools } : {}),
       // Adaptive thinking is the only shape supported across the current
       // generation; the legacy `enabled` + budget form 400s on Opus 5.5.
@@ -282,6 +307,8 @@ export class AnthropicProvider implements ModelProvider {
               yield { type: 'text_delta', text: delta.text }
             } else if (delta.type === 'thinking_delta') {
               yield { type: 'thinking_delta', thinking: delta.thinking }
+            } else if (delta.type === 'signature_delta') {
+              yield { type: 'thinking_signature', signature: delta.signature }
             } else if (delta.type === 'input_json_delta') {
               partialJson.set(
                 event.index,
@@ -369,7 +396,13 @@ export class AnthropicProvider implements ModelProvider {
 function convertMessage(message: ModelRequest['messages'][number]): Anthropic.MessageParam {
   return {
     role: message.role,
-    content: message.content.map(convertBlock) as Anthropic.ContentBlockParam[],
+    content: message.content
+      // Thinking that never received a signature (another provider's reasoning,
+      // or a session saved before signatures were kept) cannot be replayed:
+      // Anthropic validates the signature and rejects the request.
+      .filter((b) => b.type !== 'thinking' || Boolean(b.signature))
+      .filter((b) => b.type !== 'citation' && b.type !== 'server_tool_use')
+      .map(convertBlock) as Anthropic.ContentBlockParam[],
   }
 }
 
@@ -380,9 +413,7 @@ function convertBlock(block: ContentBlock): Anthropic.ContentBlockParam {
     case 'thinking':
       // Anthropic validates the signature on replay, so a thinking block we
       // did not receive a signature for cannot be sent back.
-      return block.signature
-        ? { type: 'thinking', thinking: block.thinking, signature: block.signature }
-        : { type: 'redacted_thinking', data: block.thinking }
+      return { type: 'thinking', thinking: block.thinking, signature: block.signature ?? '' }
     case 'redacted_thinking':
       return { type: 'redacted_thinking', data: block.data }
     case 'tool_use':
