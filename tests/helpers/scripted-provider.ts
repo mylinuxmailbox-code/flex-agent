@@ -40,8 +40,11 @@ export class ScriptedProvider implements ModelProvider {
       },
     ]
   }
+  configured() {
+    return true
+  }
   resolveModel(spec: string) {
-    return this.listModels().find((m) => m.id === spec)
+    return spec === '' ? this.listModels()[0] : this.listModels().find((m) => m.id === spec)
   }
 
   async *stream(request: ModelRequest): AsyncGenerator<StreamEvent> {

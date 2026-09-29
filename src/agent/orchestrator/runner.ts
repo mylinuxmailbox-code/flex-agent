@@ -75,8 +75,9 @@ export interface SubagentRunnerDeps {
   sandbox: Sandbox
   logger: Logger
   workspaceRoot: string
-  model: string
-  effort: EffortProfile
+  /** Current model and effort. Functions so `/model` and `/effort` reach later fan-outs. */
+  model: string | (() => string)
+  effort: EffortProfile | (() => EffortProfile)
   sessionId: string
   /** Tools a subagent may use for side effects (shell, write). May be a getter. */
   mutatingTools: readonly string[] | (() => readonly string[])
@@ -95,6 +96,16 @@ export class SubagentRunner {
     this.#deps = deps
   }
 
+  #model(): string {
+    const m = this.#deps.model
+    return typeof m === 'function' ? m() : m
+  }
+
+  #effort(): EffortProfile {
+    const e = this.#deps.effort
+    return typeof e === 'function' ? e() : e
+  }
+
   /**
    * Run every spec, concurrently up to the cap, and collect the results.
    *
@@ -103,7 +114,7 @@ export class SubagentRunner {
    * and harder to read.
    */
   async fanOut(options: FanOutOptions): Promise<SubagentResult[]> {
-    const cap = options.maxConcurrency ?? Math.max(1, this.#deps.effort.maxSubagents || 4)
+    const cap = options.maxConcurrency ?? Math.max(1, this.#effort().maxSubagents || 4)
     const queue = [...options.specs]
     const results: SubagentResult[] = []
 
@@ -136,7 +147,7 @@ export class SubagentRunner {
     let lastTurnText = ''
 
     const allowed = this.#toolsFor(spec)
-    const effort = spec.effort ?? this.#deps.effort.subagents ?? 'high'
+    const effort = spec.effort ?? this.#effort().subagents ?? 'high'
 
     // A subagent is an ordinary agent loop with a narrower tool set and a role
     // prompt. Running the real loop (rather than a second, lighter one) means it
@@ -154,8 +165,8 @@ export class SubagentRunner {
       permissions: this.#deps.permissions,
       sandbox: this.#deps.sandbox,
       logger: this.#deps.logger.child({ subagent: spec.id, role: spec.role }),
-      model: spec.model ?? this.#deps.model,
-      effort: { ...this.#deps.effort, main: effort, subagents: null },
+      model: spec.model ?? this.#model(),
+      effort: { ...this.#effort(), main: effort, subagents: null },
       sessionId: `${this.#deps.sessionId}:${spec.id}`,
       systemText: roleSystemPrompt(spec.role, spec.task),
       maxTurns: MAX_SUBAGENT_TURNS,

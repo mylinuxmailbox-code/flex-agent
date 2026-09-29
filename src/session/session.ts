@@ -96,6 +96,7 @@ export class Session {
   #activeModel: string
   #activeEffort: EffortLevel
   #createdAt: number = Date.now()
+  readonly #syncSubagentTool: (profile: ReturnType<typeof effortProfile>) => void
 
   private constructor(init: {
     config: ResolvedSessionConfig
@@ -108,6 +109,7 @@ export class Session {
     permissions: PermissionEngine
     runtime: AgentRuntime
     providers: ModelProvider[]
+    syncSubagentTool: (profile: ReturnType<typeof effortProfile>) => void
   }) {
     this.config = init.config
     this.router = init.router
@@ -119,6 +121,7 @@ export class Session {
     this.permissions = init.permissions
     this.runtime = init.runtime
     this.providers = init.providers
+    this.#syncSubagentTool = init.syncSubagentTool
     this.#activeModel = init.config.model
     this.#activeEffort = init.config.effort
   }
@@ -232,27 +235,37 @@ export class Session {
 
     // Subagent delegation is only advertised when the effort profile actually
     // fans out; in single-agent modes the model never sees the option at all.
+    // `/effort` can switch between the two mid-session, so this is re-run then.
+    const runner = new SubagentRunner({
+      provider: router,
+      tools,
+      permissions,
+      sandbox,
+      logger,
+      workspaceRoot,
+      // Read at spawn time, so `/model` and `/effort` apply to later fan-outs.
+      model: () => runtimeRef?.model ?? effectiveModel,
+      effort: () => runtimeRef?.effort ?? profile,
+      sessionId: id,
+      // A getter, because MCP and plugin tools register after this point.
+      mutatingTools: () =>
+        tools
+          .visible()
+          .filter((t) => !t.readOnly)
+          .map((t) => t.name),
+      noteFileChange: (path) => runtimeRef?.trackFile(path),
+      web: settings.web,
+    })
+    const syncSubagentTool = (p: ReturnType<typeof effortProfile>): void => {
+      if (p.subagents) {
+        tools.unregister('spawn_subagent')
+        tools.register(createSpawnSubagentTool(runner, p.maxSubagents))
+      } else {
+        tools.unregister('spawn_subagent')
+      }
+    }
+    syncSubagentTool(profile)
     if (profile.subagents) {
-      const runner = new SubagentRunner({
-        provider: router,
-        tools,
-        permissions,
-        sandbox,
-        logger,
-        workspaceRoot,
-        model: effectiveModel,
-        effort: profile,
-        sessionId: id,
-        // A getter, because MCP and plugin tools register after this point.
-        mutatingTools: () =>
-          tools
-            .visible()
-            .filter((t) => !t.readOnly)
-            .map((t) => t.name),
-        noteFileChange: (path) => runtimeRef?.trackFile(path),
-        web: settings.web,
-      })
-      tools.register(createSpawnSubagentTool(runner, profile.maxSubagents))
       logger.info('subagent orchestration enabled', {
         main: profile.main,
         subagents: profile.subagents,
@@ -355,6 +368,7 @@ export class Session {
       permissions,
       providers,
       runtime,
+      syncSubagentTool,
     })
   }
 
@@ -487,7 +501,9 @@ export class Session {
 
   setEffort(effort: EffortLevel): void {
     this.#activeEffort = effort
-    this.runtime.setEffort(effortProfile(effort))
+    const profile = effortProfile(effort)
+    this.runtime.setEffort(profile)
+    this.#syncSubagentTool(profile)
   }
 
   setPermissionMode(mode: PermissionMode): void {

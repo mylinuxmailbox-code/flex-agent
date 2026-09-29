@@ -124,6 +124,14 @@ export class AgentRuntime {
     ;(this.#opts as { effort: EffortProfile }).effort = effort
   }
 
+  get model(): string {
+    return this.#opts.model
+  }
+
+  get effort(): EffortProfile {
+    return this.#opts.effort
+  }
+
   get sessionId(): string {
     return this.#opts.sessionId
   }
